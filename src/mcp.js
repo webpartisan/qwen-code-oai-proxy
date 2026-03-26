@@ -147,11 +147,19 @@ const mcpPostHandler = async (req, res) => {
           }
 
           try {
-            // Use the /v1/web/search endpoint
-            const response = await axios.post(`http://${config.host}:${config.port}/v1/web/search`, {
+            const internalBaseUrl = `http://${config.host}:${config.port}`;
+            const headers = {};
+
+            if (Array.isArray(config.apiKey) && config.apiKey.length > 0) {
+              headers['x-api-key'] = config.apiKey[0];
+            }
+
+            const response = await axios.post(`${internalBaseUrl}/v1/web/search`, {
               query: query.trim(),
               page: page || 1,
               rows: rows || 10
+            }, {
+              headers
             });
 
             sendResponse({

@@ -7,6 +7,9 @@ const path = require('path');
 const { promises: fs } = require('fs');
 const crypto = require('crypto');
 const { AccountHealthManager } = require('../utils/accountHealthManager.js');
+const { isRateLimitError } = require('../utils/errorFormatter.js');
+const { ProxyManager } = require('../utils/proxyManager.js');
+const config = require('../config.js');
 
 // Create HTTP agents with connection pooling
 const httpAgent = new http.Agent({
@@ -269,9 +272,9 @@ function isAuthError(error) {
 function isQuotaExceededError(error) {
   if (!error) return false;
 
-  const errorMessage = 
-    error instanceof Error 
-      ? error.message.toLowerCase() 
+  const errorMessage =
+    error instanceof Error
+      ? error.message.toLowerCase()
       : String(error).toLowerCase();
 
   // Define a type for errors that might have status or code properties
@@ -281,8 +284,39 @@ function isQuotaExceededError(error) {
   return (
     errorMessage.includes('insufficient_quota') ||
     errorMessage.includes('free allocated quota exceeded') ||
-    (errorMessage.includes('quota') && errorMessage.includes('exceeded')) ||
-    errorCode === 429
+    (errorMessage.includes('quota') && errorMessage.includes('exceeded'))
+  );
+}
+
+/**
+ * Check if an error is a network/proxy transport error (not HTTP error)
+ * @param {Error} error - The error object
+ * @returns {boolean} True if network/proxy error
+ */
+function isNetworkProxyError(error) {
+  if (!error) return false;
+
+  const code = error.code || error.cause?.code || '';
+  const message = String(error.message || '').toLowerCase();
+
+  const networkCodes = new Set([
+    'ECONNRESET',
+    'ECONNREFUSED',
+    'ETIMEDOUT',
+    'ECONNABORTED',
+    'EHOSTUNREACH',
+    'ENETUNREACH',
+    'EPIPE',
+    'ERR_SOCKET_CLOSED'
+  ]);
+
+  if (networkCodes.has(code)) return true;
+
+  return (
+    message.includes('socket hang up') ||
+    message.includes('tunneling socket') ||
+    message.includes('proxy connection') ||
+    message.includes('connect econn')
   );
 }
 
@@ -304,7 +338,10 @@ class QwenAPI {
     this.webSearchRequestCounts = new Map();
     this.webSearchResultCounts = new Map();
     
-    this.healthManager = new AccountHealthManager(this.authManager.qwenDir);
+    this.healthManager = new AccountHealthManager(this.authManager.qwenDir, config.maxRequestsPerMinute);
+    this.proxyManager = new ProxyManager(config);
+    
+    this.lastBindingSignature = null;
     
     this.loadRequestCounts();
   }
@@ -543,7 +580,7 @@ class QwenAPI {
       return null;
     }
 
-    if (!ignoreRateLimit && this.healthManager.isRateLimited(accountId)) {
+    if (!ignoreRateLimit && this.healthManager.isRateLimited(accountId, true)) {
       return null;
     }
 
@@ -581,20 +618,13 @@ class QwenAPI {
       }
     }
 
-    prepared.sort((a, b) => {
-      if (a.strikes !== b.strikes) {
-        return a.strikes - b.strikes;
-      }
-
-      return b.minutesLeft - a.minutesLeft;
-    });
-
     return prepared;
   }
 
   async getCandidatePool(accountIds, attemptsByAccount = new Map()) {
     const untriedIds = accountIds.filter((accountId) => !attemptsByAccount.has(accountId));
     let candidates = await this.getPreparedAccounts(untriedIds);
+
 
     if (candidates.length > 0) {
       return candidates;
@@ -619,23 +649,247 @@ class QwenAPI {
     }
 
     try {
-      this.healthManager.incrementRateLimit(accountInfo.accountId);
       return await executeAttempt(accountInfo);
     } finally {
       this.releaseAccountLock(accountInfo.accountId);
     }
   }
 
-  async executeOperationWithAccount(accountInfo, executeAttempt) {
+  /**
+   * Sleep for a given number of milliseconds
+   * @param {number} ms - Milliseconds to sleep
+   * @returns {Promise<void>}
+   */
+  async sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Refresh account proxy bindings from the full account list
+   * Called at startup and when account list changes
+   */
+  async refreshAccountProxyBindings() {
+    await this.authManager.loadAllAccounts();
+
+    const allAccountIds = (this.authManager.getAccountIds().length > 0
+      ? this.authManager.getAccountIds()
+      : ['default'])
+      .slice()
+      .sort();
+
+    const signature = JSON.stringify(allAccountIds);
+    if (this.lastBindingSignature === signature && this.proxyManager.hasBindings()) {
+      return;
+    }
+
+    this.proxyManager.initializeBindings(allAccountIds);
+    this.lastBindingSignature = signature;
+  }
+
+  /**
+   * Build list of accounts to use for a request
+   * @param {Object} request - The request object
+   * @returns {Array<string>} List of account IDs
+   */
+  buildAccountList(request) {
+    const accountIds = this.proxyManager.resolveRequestAccountIds(request.accountId);
+
+    if (request.accountId) {
+      return accountIds;
+    }
+
+    return this.authManager.getRotationOrderedAccountIds(accountIds);
+  }
+
+  /**
+   * Wait for account and IP rate limits before making a request
+   * @param {string} accountId - The account ID
+   * @returns {Promise<string>} The proxy ID to use
+   */
+  async waitForAccountAndIpRateLimit(accountId) {
+    while (this.healthManager.isRateLimited(accountId)) {
+      const accountRemainingTime = this.healthManager.getRateLimitRemainingTime(accountId);
+      if (accountRemainingTime > 0) {
+        console.log(`\x1b[36mAccount rate limit hit for ${accountId} (${this.healthManager.getRateLimitCount(accountId)}/${this.healthManager.rateLimitMax} requests/min, ${Math.round(accountRemainingTime / 1000)}s remaining)\x1b[0m`);
+        await this.sleep(accountRemainingTime);
+      }
+    }
+
+    const proxyId = this.proxyManager.ensureUsableProxyForAccount(accountId);
+    if (!proxyId) {
+      const error = new Error(`No usable proxy route is currently available for account ${accountId}`);
+      error.code = 'NO_USABLE_PROXY_ROUTE';
+      throw error;
+    }
+
+    while (this.proxyManager.isIpRateLimited(proxyId)) {
+      const ipRemainingTime = this.proxyManager.getIpRateLimitRemainingTime(proxyId);
+      if (ipRemainingTime > 0) {
+        console.log(`\x1b[36mIP rate limit hit for ${proxyId} (${this.proxyManager.getIpRateLimitCount(proxyId)}/${this.proxyManager.rateLimitMax} requests/min, ${Math.round(ipRemainingTime / 1000)}s remaining)\x1b[0m`);
+        await this.sleep(ipRemainingTime);
+      }
+    }
+
+    return proxyId;
+  }
+
+  /**
+   * Get axios configuration for a given account
+   * @param {string} accountId - The account ID
+   * @param {Object} options - Options object
+   * @param {boolean} options.stream - Whether this is a streaming request
+   * @returns {Object} Axios configuration object
+   */
+  getAxiosConfigForAccount(accountId, { stream = false } = {}) {
+    const proxyId = this.proxyManager.ensureUsableProxyForAccount(accountId);
+    if (!proxyId) {
+      const error = new Error(`No usable proxy route is currently available for account ${accountId}`);
+      error.code = 'NO_USABLE_PROXY_ROUTE';
+      throw error;
+    }
+    return this.proxyManager.getAxiosNetworkConfig(proxyId, { stream });
+  }
+
+  /**
+   * Handle successful proxy usage (record success and increment IP rate limit)
+   * @param {string} accountId - The account ID
+   */
+  handleSuccessfulProxyUsage(accountId) {
+    const proxyId = this.proxyManager.getProxyForAccount(accountId);
+    if (!proxyId) return;
+    this.proxyManager.recordProxySuccess(proxyId);
+    this.proxyManager.incrementIpRateLimit(proxyId);
+  }
+
+  /**
+   * Normalize an operation error into a standardized outcome object
+   * @param {Object} accountInfo - The account info
+   * @param {Error} error - The error that occurred
+   * @returns {Object|null} Normalized outcome object or null if auth error needing refresh
+   */
+  normalizeOperationError(accountInfo, error) {
+    if (error?.code === 'ACCOUNT_LOCKED') {
+      return { error, countStrike: false, locked: true };
+    }
+
+    if (error?.code === 'NO_USABLE_PROXY_ROUTE') {
+      return {
+        error,
+        countStrike: false,
+        locked: false,
+        isNoUsableProxyRoute: true,
+      };
+    }
+
+    if (isQuotaExceededError(error)) {
+      return {
+        error,
+        countStrike: false,
+        locked: false,
+        isQuotaExceeded: true,
+      };
+    }
+
+    const proxyId = this.proxyManager.getProxyForAccount(accountInfo.accountId);
+    if (proxyId && isNetworkProxyError(error)) {
+      const becameBad = this.proxyManager.recordProxyNetworkError(proxyId);
+      if (becameBad) {
+        this.proxyManager.rebindAccountFromBadProxy(accountInfo.accountId);
+      }
+
+      return {
+        error,
+        countStrike: false,
+        locked: false,
+        isProxyNetworkError: true,
+      };
+    }
+
+    if (!isAuthError(error)) {
+      return {
+        error,
+        countStrike: false,
+        locked: false,
+      };
+    }
+
+    return null;
+  }
+
+  async executeOperationWithAccount(accountInfo, executeAttempt, rateLimitRetryCount = 0) {
     try {
       return await this.executeAttemptWithLock(accountInfo, executeAttempt);
     } catch (error) {
-      if (error.code === 'ACCOUNT_LOCKED') {
-        throw { error, countStrike: false, locked: true };
+      const normalizedInitialError = this.normalizeOperationError(accountInfo, error);
+
+      if (
+        normalizedInitialError?.locked ||
+        normalizedInitialError?.isNoUsableProxyRoute ||
+        normalizedInitialError?.isProxyNetworkError ||
+        normalizedInitialError?.isQuotaExceeded
+      ) {
+        throw normalizedInitialError;
       }
 
-      if (!isAuthError(error)) {
-        throw { error, countStrike: true, locked: false };
+      // Handle rate limit errors (429) with exponential backoff
+      if (isRateLimitError(error)) {
+        const errorMessage = error?.response?.data?.message || error?.message || 'Too Many Requests';
+        const statusCode = error?.response?.status || 429;
+        
+        // Get current rate limit counts for debugging
+        const accountCount = this.healthManager.getRateLimitCount(accountInfo.accountId);
+        const proxyId = this.proxyManager.getProxyForAccount(accountInfo.accountId);
+        const ipCount = proxyId ? this.proxyManager.getIpRateLimitCount(proxyId) : 0;
+        
+        console.log(`\x1b[33mRate limit hit for ${accountInfo.accountId}: ${statusCode} ${errorMessage} (account: ${accountCount}/${this.healthManager.rateLimitMax}, ip: ${ipCount}/${this.proxyManager.rateLimitMax})\x1b[0m`);
+        
+        // Check if we've exhausted rate limit retries
+        if (rateLimitRetryCount >= config.rateLimitMaxRetries) {
+          console.log(`\x1b[31mRate limit retries exhausted for ${accountInfo.accountId} after ${rateLimitRetryCount} attempts\x1b[0m`);
+          throw {
+            error,
+            countStrike: false,
+            locked: false,
+            isRateLimit: true
+          };
+        }
+        
+        // Calculate exponential backoff delay: 2s, 4s, 8s, 16s, 32s
+        const baseDelay = config.rateLimitRetryDelayMs;
+        const exponentialDelay = baseDelay * Math.pow(2, rateLimitRetryCount);
+        const jitter = Math.random() * 1000; // Add up to 1s jitter to prevent thundering herd
+        const totalDelay = exponentialDelay + jitter;
+        
+        console.log(`\x1b[36mWaiting ${Math.round(totalDelay)}ms before retry ${rateLimitRetryCount + 1}/${config.rateLimitMaxRetries} for ${accountInfo.accountId}\x1b[0m`);
+        await this.sleep(totalDelay);
+        
+        // Retry with the same account
+        try {
+          return await this.executeAttemptWithLock(accountInfo, executeAttempt);
+        } catch (retryError) {
+          if (retryError?.code === 'ACCOUNT_LOCKED') {
+            throw { error: retryError, countStrike: false, locked: true };
+          }
+
+          if (isRateLimitError(retryError)) {
+            return await this.executeOperationWithAccount(accountInfo, executeAttempt, rateLimitRetryCount + 1);
+          }
+
+          const normalizedRetryError = this.normalizeOperationError(accountInfo, retryError);
+          if (normalizedRetryError) {
+            throw normalizedRetryError;
+          }
+
+          throw {
+            error: retryError,
+            countStrike: false,
+            locked: false,
+          };
+        }
+      }
+
+      if (normalizedInitialError) {
+        throw normalizedInitialError;
       }
 
       console.log(`\x1b[33mAuth error for ${accountInfo.accountId}, attempting refresh...\x1b[0m`);
@@ -644,6 +898,10 @@ class QwenAPI {
       try {
         refreshedCredentials = await this.refreshCredentialsForAccount(accountInfo.accountId, accountInfo.credentials);
       } catch (refreshError) {
+        const normalizedAuthRetryError = this.normalizeOperationError(accountInfo, refreshError);
+        if (normalizedAuthRetryError) {
+          throw normalizedAuthRetryError;
+        }
         throw { error: refreshError, countStrike: false, locked: false };
       }
 
@@ -656,15 +914,12 @@ class QwenAPI {
           executeAttempt
         );
       } catch (retryError) {
-        if (retryError.code === 'ACCOUNT_LOCKED') {
-          throw { error: retryError, countStrike: false, locked: true };
+        const normalizedAuthRetryError = this.normalizeOperationError(accountInfo, retryError);
+        if (normalizedAuthRetryError) {
+          throw normalizedAuthRetryError;
         }
 
-        throw {
-          error: retryError,
-          countStrike: !isAuthError(retryError),
-          locked: false,
-        };
+        throw { error: retryError, countStrike: false, locked: false };
       }
     }
   }
@@ -691,6 +946,7 @@ class QwenAPI {
           attemptsUsed += 1;
           attemptsByAccount.set(candidate.accountId, (attemptsByAccount.get(candidate.accountId) || 0) + 1);
 
+          console.log(`\x1b[36mSelected account for request attempt: ${candidate.accountId}\x1b[0m`);
           const result = await this.executeOperationWithAccount(candidate, executeAttempt);
           attemptedRequest = true;
           await onSuccess(candidate.accountId, result);
@@ -711,10 +967,34 @@ class QwenAPI {
           attemptedRequest = true;
           lastError = outcome.error || outcome;
 
-          if (outcome.countStrike) {
-            this.healthManager.addStrike(candidate.accountId);
+          // Handle rate limit errors - don't add strikes, just try next account
+          if (outcome.isRateLimit) {
+            console.log(`\x1b[33mAccount ${candidate.accountId} rate limited, trying next account...\x1b[0m`);
+            break;
           }
 
+          // Handle no usable proxy route - don't add strikes, just try next account
+          if (outcome.isNoUsableProxyRoute) {
+            console.warn(`\x1b[33mAccount ${candidate.accountId} currently has no usable proxy route, trying next account...\x1b[0m`);
+            break;
+          }
+
+          // Handle proxy/network transport errors - don't add strikes, just try next account
+          if (outcome.isProxyNetworkError) {
+            console.warn(`\x1b[33mAccount ${candidate.accountId} hit a proxy/network transport error, trying next account...\x1b[0m`);
+            break;
+          }
+
+          // Handle quota exhaustion - the ONLY case that adds a strike
+          if (outcome.isQuotaExceeded) {
+            const errorMessage = outcome.error?.response?.data?.message || outcome.error?.message || 'quota exceeded';
+            this.healthManager.addStrike(candidate.accountId, `quota exceeded: ${errorMessage}`);
+            console.warn(`\x1b[33mAccount ${candidate.accountId} hit quota exhaustion, strike added and trying next account...\x1b[0m`);
+            break;
+          }
+
+          // Generic non-quota failures - no strike added
+          console.warn(`\x1b[33mAccount ${candidate.accountId} failed without quota exhaustion; no strike added.\x1b[0m ${outcome.error}`);
           break;
         }
       }
@@ -756,16 +1036,19 @@ class QwenAPI {
   }
 
   async chatCompletions(request) {
-    await this.authManager.loadAllAccounts();
-    const configuredAccounts = request.accountId
-      ? [request.accountId]
-      : (this.authManager.getAccountIds().length > 0 ? this.authManager.getAccountIds() : ['default']);
+    await this.refreshAccountProxyBindings();
+    const configuredAccounts = this.buildAccountList(request);
 
     return await this.executeWithAccountRotation(
       configuredAccounts,
-      async (accountInfo) => this.processRequestWithAccount(request, accountInfo),
+      async (accountInfo) => {
+        await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
+        return this.processRequestWithAccount(request, accountInfo);
+      },
       async (accountId, response) => {
         await this.incrementRequestCount(accountId);
+        this.healthManager.incrementAccountRateLimit(accountId);
+        this.handleSuccessfulProxyUsage(accountId);
 
         if (response && response.usage) {
           await this.recordTokenUsage(
@@ -804,11 +1087,12 @@ class QwenAPI {
 
     const headers = buildDashScopeHeaders(credentials.access_token, false);
 
+    const networkConfig = this.getAxiosConfigForAccount(accountInfo.accountId, { stream: false });
+
     const response = await axios.post(url, payload, {
-      headers: headers,
+      headers,
       timeout: 300000,
-      httpAgent,
-      httpsAgent
+      ...networkConfig,
     });
 
     return response.data;
@@ -878,12 +1162,13 @@ class QwenAPI {
     };
     const headers = buildDashScopeHeaders(credentials.access_token, true);
     const stream = new PassThrough();
+
+    const networkConfig = this.getAxiosConfigForAccount(accountInfo.accountId, { stream: true });
+
     const response = await axios.post(url, payload, {
       headers,
       timeout: 300000,
-      responseType: 'stream',
-      httpAgent,
-      httpsAgent
+      ...networkConfig,
     });
 
     response.data.pipe(stream);
@@ -896,16 +1181,19 @@ class QwenAPI {
    * @returns {Promise<Stream>} - A stream of SSE events
    */
   async streamChatCompletions(request) {
-    await this.authManager.loadAllAccounts();
-    const configuredAccounts = request.accountId
-      ? [request.accountId]
-      : (this.authManager.getAccountIds().length > 0 ? this.authManager.getAccountIds() : ['default']);
+    await this.refreshAccountProxyBindings();
+    const configuredAccounts = this.buildAccountList(request);
 
     return await this.executeWithAccountRotation(
       configuredAccounts,
-      async (accountInfo) => this.processStreamingRequestWithAccount(request, accountInfo),
+      async (accountInfo) => {
+        await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
+        return this.processStreamingRequestWithAccount(request, accountInfo);
+      },
       async (accountId) => {
         await this.incrementRequestCount(accountId);
+        this.healthManager.incrementAccountRateLimit(accountId);
+        this.handleSuccessfulProxyUsage(accountId);
       }
     );
   }
@@ -913,19 +1201,22 @@ class QwenAPI {
   /**
    * Perform web search using Qwen's web search API
    * @param {Object} request - The web search request
-    * @returns {Promise<Object>} - Web search results
+     * @returns {Promise<Object>} - Web search results
    */
   async webSearch(request) {
-    await this.authManager.loadAllAccounts();
-    const configuredAccounts = request.accountId
-      ? [request.accountId]
-      : (this.authManager.getAccountIds().length > 0 ? this.authManager.getAccountIds() : ['default']);
+    await this.refreshAccountProxyBindings();
+    const configuredAccounts = this.buildAccountList(request);
 
     return await this.executeWithAccountRotation(
       configuredAccounts,
-      async (accountInfo) => this.processWebSearchWithAccount(request, accountInfo),
+      async (accountInfo) => {
+        await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
+        return this.processWebSearchWithAccount(request, accountInfo);
+      },
       async (accountId, response) => {
         await this.incrementWebSearchRequestCount(accountId);
+        this.healthManager.incrementAccountRateLimit(accountId);
+        this.handleSuccessfulProxyUsage(accountId);
 
         const resultCount = response?.data?.docs?.length || 0;
         if (resultCount > 0) {
@@ -968,11 +1259,12 @@ class QwenAPI {
 
     const headers = buildDashScopeHeaders(credentials.access_token, false);
 
+    const networkConfig = this.getAxiosConfigForAccount(accountInfo.accountId, { stream: false });
+
     const response = await axios.post(webSearchUrl, payload, {
-      headers: headers,
+      headers,
       timeout: 300000,
-      httpAgent,
-      httpsAgent
+      ...networkConfig,
     });
 
     console.log(`\x1b[32mWeb search completed using ${accountId}. Found ${response.data?.data?.total || 0} results.\x1b[0m`);

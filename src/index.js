@@ -80,8 +80,32 @@ class QwenOpenAIProxy {
         return res.status(validationError.status).json(validationError.body);
       }
 
+      if (error?.code === 'ACCOUNT_NOT_USABLE_IN_PROXY_MODE') {
+        fileLogger.logError(requestId, displayAccount, 400, error.message);
+        return res.status(400).json({
+          error: {
+            message: error.message,
+            type: 'invalid_request_error',
+            code: 'account_not_usable_in_proxy_mode'
+          }
+        });
+      }
+
+      if (error?.code === 'NO_USABLE_PROXY_ROUTE') {
+        fileLogger.logError(requestId, displayAccount, 503, error.message);
+        return res.status(503).json({
+          error: {
+            message: error.message,
+            type: 'proxy_routing_error',
+            code: 'no_usable_proxy_route'
+          }
+        });
+      }
+
       fileLogger.logError(requestId, displayAccount, 500, error.message);
-      
+      //  statusCode: 429,
+      // statusMessage: 'Too Many Requests',
+      // TODO if 429 + Too Many Requests - increase wait time for account
       liveLogger.proxyError(requestId, 500, displayAccount, error.message);
       
       if (error.message.includes('Not authenticated') || error.message.includes('access token')) {
@@ -233,6 +257,36 @@ class QwenOpenAIProxy {
       
       liveLogger.proxyError(requestId, statusCode, displayAccount, error.message);
       
+      if (error?.code === 'ACCOUNT_NOT_USABLE_IN_PROXY_MODE') {
+        if (!res.headersSent) {
+          fileLogger.logError(requestId, displayAccount, 400, error.message);
+          liveLogger.proxyError(requestId, 400, displayAccount, error.message);
+          return res.status(400).json({
+            error: {
+              message: error.message,
+              type: 'invalid_request_error',
+              code: 'account_not_usable_in_proxy_mode'
+            }
+          });
+        }
+        return;
+      }
+
+      if (error?.code === 'NO_USABLE_PROXY_ROUTE') {
+        if (!res.headersSent) {
+          fileLogger.logError(requestId, displayAccount, 503, error.message);
+          liveLogger.proxyError(requestId, 503, displayAccount, error.message);
+          return res.status(503).json({
+            error: {
+              message: error.message,
+              type: 'proxy_routing_error',
+              code: 'no_usable_proxy_route'
+            }
+          });
+        }
+        return;
+      }
+
       if (error.message.includes('Not authenticated') || error.message.includes('access token')) {
         const authError = ErrorFormatter.openAIAuthError();
         if (!res.headersSent) {
@@ -408,6 +462,30 @@ class QwenOpenAIProxy {
         liveLogger.proxyError(requestId, 400, 'web', error.message);
         const validationError = ErrorFormatter.openAIValidationError(error.message);
         return res.status(validationError.status).json(validationError.body);
+      }
+
+      if (error?.code === 'ACCOUNT_NOT_USABLE_IN_PROXY_MODE') {
+        fileLogger.logError(requestId, 'web', 400, error.message);
+        liveLogger.proxyError(requestId, 400, 'web', error.message);
+        return res.status(400).json({
+          error: {
+            message: error.message,
+            type: 'invalid_request_error',
+            code: 'account_not_usable_in_proxy_mode'
+          }
+        });
+      }
+
+      if (error?.code === 'NO_USABLE_PROXY_ROUTE') {
+        fileLogger.logError(requestId, 'web', 503, error.message);
+        liveLogger.proxyError(requestId, 503, 'web', error.message);
+        return res.status(503).json({
+          error: {
+            message: error.message,
+            type: 'proxy_routing_error',
+            code: 'no_usable_proxy_route'
+          }
+        });
       }
 
       fileLogger.logError(requestId, 'web', 500, error.message);
@@ -621,6 +699,17 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
+async function printProxyRoutingSummary() {
+  await qwenAPI.refreshAccountProxyBindings();
+
+  const lines = qwenAPI.proxyManager.getStartupSummary();
+
+  console.log('\x1b[36mRouting summary:\x1b[0m');
+  for (const line of lines) {
+    console.log(`  ${line}`);
+  }
+}
+
 app.listen(PORT, HOST, async () => {
   liveLogger.serverStarted(HOST, PORT);
 
@@ -658,6 +747,8 @@ app.listen(PORT, HOST, async () => {
   } catch (error) {
     console.log('\x1b[33mWarning: Could not load accounts\x1b[0m');
   }
+
+  await printProxyRoutingSummary();
 
   try {
     await accountRefreshScheduler.initialize();

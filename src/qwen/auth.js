@@ -4,7 +4,6 @@ const { fetch } = require('undici');
 const crypto = require('crypto');
 const open = require('open');
 const qrcode = require('qrcode-terminal');
-
 // File System Configuration
 const QWEN_DIR = '.qwen';
 const QWEN_CREDENTIAL_FILENAME = 'oauth_creds.json';
@@ -55,8 +54,9 @@ class QwenAuthManager {
     this.credentialsPath = path.join(this.qwenDir, QWEN_CREDENTIAL_FILENAME);
     this.credentials = null;
     this.refreshPromise = null;
-    this.accounts = new Map(); // For multi-account support
+    this.accounts = new Map(); // For multi-account-support (email -> credentials)
     this.currentAccountIndex = 0; // For round-robin account selection
+    this.accountsHaveBeenLoaded = false; // Track if accounts were already loaded to avoid verbose logging
   }
 
   init(qwenAPI) {
@@ -125,15 +125,24 @@ class QwenAuthManager {
           const credentialsData = await fs.readFile(accountPath, 'utf8');
           const credentials = JSON.parse(credentialsData);
           
-          // Extract account ID from filename
-          const accountId = file.substring(
+          // Extract account email from filename (e.g., oauth_creds_user@example.com.json → user@example.com)
+          const email = file.substring(
             QWEN_MULTI_ACCOUNT_PREFIX.length,
             file.length - QWEN_MULTI_ACCOUNT_SUFFIX.length
           );
           
-          this.accounts.set(accountId, credentials);
+          // Store account with email as key (direct mapping)
+          this.accounts.set(email, credentials);
         } catch (error) {
           console.warn(`Failed to load account from ${file}:`, error.message);
+        }
+      }
+      
+      // Only log summary - show detailed list only on first load
+      if (this.accounts.size > 0) {
+        if (!this.accountsHaveBeenLoaded) {
+          console.log(`\x1b[36mLoaded ${this.accounts.size} account(s)\x1b[0m`);
+          this.accountsHaveBeenLoaded = true;
         }
       }
       
@@ -188,7 +197,7 @@ class QwenAuthManager {
   }
 
   /**
-   * Get a list of all account IDs
+   * Get a list of all account IDs (short IDs)
    * @returns {string[]} Array of account IDs
    */
   getAccountIds() {
@@ -197,11 +206,29 @@ class QwenAuthManager {
 
   /**
    * Get credentials for a specific account
-   * @param {string} accountId - The account ID
+   * @param {string} accountId - The account ID (short ID)
    * @returns {Object|null} The credentials or null if not found
    */
   getAccountCredentials(accountId) {
     return this.accounts.get(accountId) || null;
+  }
+
+  /**
+   * Get the email for an account ID (identity function since email = account ID)
+   * @param {string} accountId - The account ID (email)
+   * @returns {string|null} The email address or null if not found
+   */
+  getEmailForAccountId(accountId) {
+    return accountId;
+  }
+
+  /**
+   * Get the account ID for an email address (identity function since email = account ID)
+   * @param {string} email - The email address
+   * @returns {string|null} The account ID or null if not found
+   */
+  getAccountIdForEmail(email) {
+    return email;
   }
 
   /**
@@ -273,7 +300,6 @@ class QwenAuthManager {
         expiry_date: Date.now() + tokenData.expires_in * 1000,
       }
 
-      await this.saveCredentials(newCredentials);
       console.log('\x1b[32m%s\x1b[0m', 'Qwen access token refreshed successfully');
       return newCredentials;
     } catch (error) {
@@ -375,7 +401,7 @@ class QwenAuthManager {
       await this.loadAllAccounts();
     }
     
-    const accountIds = this.getAccountIds();
+    const accountIds = this.getAccountIds().slice().sort();
     
     if (accountIds.length === 0) {
       return null;
@@ -403,7 +429,7 @@ class QwenAuthManager {
       return null;
     }
     
-    const accountIds = this.getAccountIds();
+    const accountIds = this.getAccountIds().slice().sort();
     
     if (accountIds.length === 0) {
       return null;
@@ -414,6 +440,54 @@ class QwenAuthManager {
     const credentials = this.getAccountCredentials(accountId);
     
     return { accountId, credentials };
+  }
+
+  /**
+   * Get account IDs in rotation order starting from the next eligible account
+   * @param {string[]} availableAccountIds - Array of available account IDs to filter
+   * @returns {string[]} Ordered array of account IDs in round-robin order
+   */
+  getRotationOrderedAccountIds(availableAccountIds) {
+    const allAccountIds = this.getAccountIds().slice().sort();
+
+    if (!Array.isArray(availableAccountIds) || availableAccountIds.length === 0) {
+      return [];
+    }
+
+    if (!Array.isArray(allAccountIds) || allAccountIds.length === 0) {
+      return [...availableAccountIds];
+    }
+
+    const availableSet = new Set(availableAccountIds);
+    const total = allAccountIds.length;
+    const normalizedStart = ((this.currentAccountIndex % total) + total) % total;
+
+    let firstEligibleGlobalIndex = -1;
+
+    for (let offset = 0; offset < total; offset++) {
+      const idx = (normalizedStart + offset) % total;
+      const accountId = allAccountIds[idx];
+      if (availableSet.has(accountId)) {
+        firstEligibleGlobalIndex = idx;
+        break;
+      }
+    }
+
+    if (firstEligibleGlobalIndex === -1) {
+      return [];
+    }
+
+    const ordered = [];
+    for (let offset = 0; offset < total; offset++) {
+      const idx = (firstEligibleGlobalIndex + offset) % total;
+      const accountId = allAccountIds[idx];
+      if (availableSet.has(accountId)) {
+        ordered.push(accountId);
+      }
+    }
+
+    this.currentAccountIndex = (firstEligibleGlobalIndex + 1) % total;
+    return ordered;
   }
 
   /**

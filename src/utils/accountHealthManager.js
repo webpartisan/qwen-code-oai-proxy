@@ -12,18 +12,19 @@ const { promises: fs } = require('fs');
  * Block times: 1min, 5min, 15min, 30min, 60min, 12hr
  */
 class AccountHealthManager {
-  constructor(dataDir) {
+  constructor(dataDir, maxRequestsPerMinute = 60) {
     this.dataDir = dataDir;
     this.healthFile = path.join(dataDir, 'account_health.json');
     
     this.strikes = new Map();
     this.blockedUntil = new Map();
     this.lastStrikeTime = new Map();
+    this.lastBlockReason = new Map();
     
     this.rateLimitWindow = 60000;
     this.rateLimitCount = new Map();
     this.rateLimitResetTime = new Map();
-    this.rateLimitMax = 60;
+    this.rateLimitMax = maxRequestsPerMinute;
     
     this.blockTimes = [
       0,
@@ -85,20 +86,32 @@ class AccountHealthManager {
     }
   }
 
-  addStrike(accountId) {
+  /**
+   * Add a strike to an account with optional reason
+   * @param {string} accountId - The account ID
+   * @param {string} reason - Optional reason for the strike (e.g., '429 Too Many Requests', 'quota exceeded')
+   * @returns {number} The new strike count
+   */
+  addStrike(accountId, reason = '') {
     const currentStrikes = this.strikes.get(accountId) || 0;
     const newStrikes = currentStrikes + 1;
     this.strikes.set(accountId, newStrikes);
     this.lastStrikeTime.set(accountId, Date.now());
+    
+    if (reason) {
+      this.lastBlockReason.set(accountId, reason);
+    }
     
     const blockTime = this.getBlockTime(newStrikes);
     if (blockTime > 0) {
       const blockUntil = Date.now() + blockTime;
       this.blockedUntil.set(accountId, blockUntil);
       const blockMinutes = Math.round(blockTime / 60000);
-      console.log(`\x1b[33mAccount ${accountId} blocked for ${blockMinutes}min (strike #${newStrikes})\x1b[0m`);
+      const reasonStr = reason ? `: ${reason}` : '';
+      console.log(`\x1b[33mAccount ${accountId} blocked for ${blockMinutes}min (strike #${newStrikes}${reasonStr})\x1b[0m`);
     } else {
-      console.log(`\x1b[33mAccount ${accountId} strike #${newStrikes}\x1b[0m`);
+      const reasonStr = reason ? `: ${reason}` : '';
+      console.log(`\x1b[33mAccount ${accountId} strike #${newStrikes}${reasonStr}\x1b[0m`);
     }
     
     this.save();
@@ -136,7 +149,13 @@ class AccountHealthManager {
     return Math.max(0, blockedUntil - Date.now());
   }
 
-  isRateLimited(accountId) {
+  /**
+   * Check if an account is rate limited (has reached max requests in current window)
+   * @param {string} accountId - The account ID
+   * @param {boolean} silent - If true, don't log a message
+   * @returns {boolean} True if rate limited
+   */
+  isRateLimited(accountId, silent = false) {
     const now = Date.now();
     let count = this.rateLimitCount.get(accountId) || 0;
     let resetTime = this.rateLimitResetTime.get(accountId) || now + this.rateLimitWindow;
@@ -147,14 +166,20 @@ class AccountHealthManager {
     }
     
     if (count >= this.rateLimitMax) {
-      console.log(`\x1b[33mAccount ${accountId} rate limited (${count}/${this.rateLimitMax} requests per minute)\x1b[0m`);
+      if (!silent) {
+        console.log(`\x1b[33mAccount ${accountId} rate limited (${count}/${this.rateLimitMax} requests per minute)\x1b[0m`);
+      }
       return true;
     }
     
     return false;
   }
 
-  incrementRateLimit(accountId) {
+  /**
+   * Increment the account rate limit counter
+   * @param {string} accountId - The account ID
+   */
+  incrementAccountRateLimit(accountId) {
     const now = Date.now();
     let count = this.rateLimitCount.get(accountId) || 0;
     let resetTime = this.rateLimitResetTime.get(accountId) || now + this.rateLimitWindow;
@@ -172,6 +197,48 @@ class AccountHealthManager {
     return this.strikes.get(accountId) || 0;
   }
 
+  /**
+   * Get the remaining time (in ms) until the rate limit window resets
+   * @param {string} accountId - The account ID
+   * @returns {number} Remaining time in milliseconds (0 if not rate limited)
+   */
+  getRateLimitRemainingTime(accountId) {
+    const now = Date.now();
+    let resetTime = this.rateLimitResetTime.get(accountId) || now;
+    
+    if (now >= resetTime) {
+      return 0;
+    }
+    
+    return resetTime - now;
+  }
+
+  /**
+   * Get the current rate limit count for an account
+   * @param {string} accountId - The account ID
+   * @returns {number} Current request count in the window
+   */
+  getRateLimitCount(accountId) {
+    const now = Date.now();
+    let count = this.rateLimitCount.get(accountId) || 0;
+    let resetTime = this.rateLimitResetTime.get(accountId) || now + this.rateLimitWindow;
+    
+    if (now >= resetTime) {
+      return 0;
+    }
+    
+    return count;
+  }
+
+  /**
+   * Get the last block reason for an account
+   * @param {string} accountId - The account ID
+   * @returns {string} The last block reason (empty string if none)
+   */
+  getLastBlockReason(accountId) {
+    return this.lastBlockReason.get(accountId) || '';
+  }
+
   getAvailableAccounts(allAccountIds, exclude = new Set()) {
     const now = Date.now();
     const available = [];
@@ -179,7 +246,7 @@ class AccountHealthManager {
     for (const accountId of allAccountIds) {
       if (exclude.has(accountId)) continue;
       if (this.isBlocked(accountId)) continue;
-      if (this.isRateLimited(accountId)) continue;
+      if (this.isRateLimited(accountId, true)) continue;  // Silent check
       available.push(accountId);
     }
     

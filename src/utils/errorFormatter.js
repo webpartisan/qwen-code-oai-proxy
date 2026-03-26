@@ -52,4 +52,22 @@ class ErrorFormatter {
 
 }
 
-module.exports = { ErrorFormatter };
+/**
+ * Check if an error is a rate limit error (HTTP 429)
+ * @param {Error|Object} error - Error object or response error
+ * @returns {boolean} True if the error is a rate limit error
+ */
+function isRateLimitError(error) {
+  if (!error) return false;
+  
+  const errorCode = error?.response?.status || error?.code;
+  const errorMessage = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  
+  return (
+    errorCode === 429 ||
+    errorMessage.includes('too many requests') ||
+    errorMessage.includes('rate limit')
+  );
+}
+
+module.exports = { ErrorFormatter, isRateLimitError };

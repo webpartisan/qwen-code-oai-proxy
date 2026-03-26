@@ -46,6 +46,24 @@ module.exports = {
   // Retry configuration
   maxRetries: parseInt(process.env.MAX_RETRIES || '5'),
   retryDelayMs: parseInt(process.env.RETRY_DELAY_MS || '1000'),
+  
+  // Rate limit retry configuration (exponential backoff)
+  rateLimitRetryDelayMs: parseInt(process.env.RATE_LIMIT_RETRY_DELAY_MS || '2000'),
+  rateLimitMaxRetries: parseInt(process.env.RATE_LIMIT_MAX_RETRIES || '5'),
+  
+  // Rate limit threshold (requests per minute per account)
+  maxRequestsPerMinute: parseInt(process.env.MAX_REQUESTS_PER_MINUTE || '60'),
+  
+  // Proxy configuration
+  proxyList: process.env.PROXY_LIST || '',
+  useDefaultProxyWithList: process.env.USE_DEFAULT_PROXY_WITH_LIST === 'true',
+  
+  // Proxy health configuration
+  proxyConsecutiveNetworkErrors: parseInt(process.env.PROXY_CONSECUTIVE_NETWORK_ERRORS || '3', 10),
+  badProxyCooldownMs: parseInt(process.env.BAD_PROXY_COOLDOWN_MS || '600000', 10),
+  
+  // IP-based rate limit (requests per minute per proxy/IP)
+  maxRequestsPerMinutePerIp: parseInt(process.env.MAX_REQUESTS_PER_MINUTE_PER_IP || '60'),
 
   // API Key configuration
   apiKey: process.env.API_KEY ?
