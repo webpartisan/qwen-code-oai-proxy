@@ -28,21 +28,24 @@ class ProxyManager {
     this.boundAccountIds = [];
     this.allAccountIds = [];
     this.bindingInitialized = false;
-
+   
     this.proxyConsecutiveNetworkErrors = new Map();
     this.proxyDisabledUntil = new Map();
     this.proxyCooldownMs = config.badProxyCooldownMs || 10 * 60 * 1000;
     this.proxyConsecutiveNetworkErrorsThreshold = config.proxyConsecutiveNetworkErrors || 3;
-
+   
     this.directHttpAgent = new http.Agent({ keepAlive: true });
     this.directHttpsAgent = new https.Agent({ keepAlive: true });
     this.proxyAgents = new Map();
-
+   
     this.rateLimitWindow = 60000;
     this.rateLimitMax = config.maxRequestsPerMinutePerIp || 60;
-
+   
+    this.recoveryCheckInterval = null;
+    this.recoveryCheckIntervalMs = config.proxyRecoveryCheckIntervalMs || 60000;
+   
     this.initialize(config);
-  }
+   }
   
   /**
    * Initialize proxy manager with configuration
@@ -240,32 +243,51 @@ class ProxyManager {
    * @returns {string|null} A replacement proxy ID or null if none available
    */
   findReplacementProxyId(currentProxyId, excludeAccountId = null) {
-    for (const proxyId of this.availableProxies) {
-      if (proxyId === currentProxyId) continue;
-      if (!this.isProxyUsable(proxyId)) continue;
-      if (this.isProxyAssignedToAnotherAccount(proxyId, excludeAccountId)) continue;
-      return proxyId;
-    }
-    return null;
+  	const candidates = [];
+  	
+  	for (const proxyId of this.availableProxies) {
+  		if (proxyId === currentProxyId) {
+  			candidates.push({ proxyId, status: 'skipped', reason: 'current proxy' });
+  			continue;
+  		}
+  		if (!this.isProxyUsable(proxyId)) {
+  			candidates.push({ proxyId, status: 'skipped', reason: 'not usable (disabled or rate limited)' });
+  			continue;
+  		}
+  		if (this.isProxyAssignedToAnotherAccount(proxyId, excludeAccountId)) {
+  			candidates.push({ proxyId, status: 'skipped', reason: 'assigned to another account' });
+  			continue;
+  		}
+  		candidates.push({ proxyId, status: 'available' });
+  		return proxyId;
+  	}
+  	
+  	// Log why no replacement was found
+  	console.log(`\x1b[33m[ProxyManager] No replacement found for proxy '${currentProxyId}':\x1b[0m`);
+  	candidates.forEach(c => {
+  		console.log(`\x1b[33m  - ${c.proxyId}: ${c.status} (${c.reason})\x1b[0m`);
+  	});
+  	
+  	return null;
   }
-
+  
   /**
    * Rebind an account from a bad proxy to a replacement (only free spare slots)
    * @param {string} accountId - The account ID
    * @returns {string|null} The new proxy ID or null if no replacement
    */
   rebindAccountFromBadProxy(accountId) {
-    const currentProxyId = this.accountProxyMapping.get(accountId);
-    const replacementProxyId = this.findReplacementProxyId(currentProxyId, accountId);
-
-    if (!replacementProxyId) {
-      console.warn(`\x1b[33mProxyManager:\x1b[0m No free replacement proxy slot available for account '${accountId}'`);
-      return null;
-    }
-
-    this.accountProxyMapping.set(accountId, replacementProxyId);
-    console.warn(`\x1b[36mProxyManager:\x1b[0m Account '${accountId}' re-bound from '${currentProxyId}' to '${replacementProxyId}'`);
-    return replacementProxyId;
+  	const currentProxyId = this.accountProxyMapping.get(accountId);
+  	const replacementProxyId = this.findReplacementProxyId(currentProxyId, accountId);
+  
+  	if (!replacementProxyId) {
+  		console.warn(`\x1b[33m[ProxyManager] Account '${accountId}' has no replacement proxy, will wait for recovery\x1b[0m`);
+  		return null;
+  	}
+  
+  	this.accountProxyMapping.set(accountId, replacementProxyId);
+  	console.warn(`\x1b[36m[ProxyManager] Account '${accountId}' re-bound from '${currentProxyId}' to '${replacementProxyId}'\x1b[0m`);
+  	return replacementProxyId;
   }
 
   /**
@@ -572,37 +594,130 @@ class ProxyManager {
     }
 
     return lines;
-  }
-  
-  /**
-   * Get binding information for all accounts
-   * @returns {Object} Mapping of account IDs to proxy IDs
-   */
-  getAccountBindings() {
+   }
+   
+   /**
+    * Get binding information for all accounts
+    * @returns {Object} Mapping of account IDs to proxy IDs
+    */
+   getAccountBindings() {
     return Object.fromEntries(this.accountProxyMapping);
-  }
-  
-  /**
-   * Get rate limit status for all proxies
-   * @returns {Object} Status information for each proxy
-   */
-  getRateLimitStatus() {
+   }
+   
+   /**
+    * Get rate limit status for all proxies
+    * @returns {Object} Status information for each proxy
+    */
+   getRateLimitStatus() {
     const status = {};
-    
+   
     for (const proxyId of this.availableProxies) {
-      const count = this.getIpRateLimitCount(proxyId);
-      const remainingTime = this.getIpRateLimitRemainingTime(proxyId);
-      
-      status[proxyId] = {
-        count,
-        limit: this.rateLimitMax,
-        remainingTimeMs: remainingTime,
-        isLimited: count >= this.rateLimitMax
-      };
+    	const count = this.getIpRateLimitCount(proxyId);
+    	const remainingTime = this.getIpRateLimitRemainingTime(proxyId);
+   
+    	status[proxyId] = {
+    		count,
+    		limit: this.rateLimitMax,
+    		remainingTimeMs: remainingTime,
+    		isLimited: count >= this.rateLimitMax
+    	};
     }
-    
+   
     return status;
-  }
-}
-
-module.exports = { ProxyManager };
+   }
+   
+   /**
+    * Activate a skipped account with an available proxy
+    * @param {string} availableProxyId - The proxy ID to assign
+    * @returns {string|null} The activated account ID or null if no skipped accounts
+    */
+   activateSkippedAccount(availableProxyId) {
+    if (this.skippedAccounts.length === 0) {
+    	return null;
+    }
+   
+    const accountId = this.skippedAccounts.shift();
+    this.accountProxyMapping.set(accountId, availableProxyId);
+    this.boundAccountIds.push(accountId);
+   
+    console.log(`\x1b[32m[ProxyManager] Activated skipped account '${accountId}' with proxy '${availableProxyId}'\x1b[0m`);
+    return accountId;
+   }
+   
+   /**
+    * Find an account that currently has no usable proxy
+    * @returns {string|null} The account ID or null if all accounts have usable proxies
+    */
+   findAccountWithoutUsableProxy() {
+    for (const [accountId, proxyId] of this.accountProxyMapping.entries()) {
+    	if (!this.isProxyUsable(proxyId)) {
+    		return accountId;
+    	}
+    }
+    return null;
+   }
+   
+   /**
+    * Check and recover proxies that have finished their cooldown period
+    * Also rebinds accounts that were waiting for proxy recovery
+    */
+   checkAndRecoverProxies() {
+    const now = Date.now();
+    const recoveredProxies = [];
+   
+    for (const [proxyId, disabledUntil] of this.proxyDisabledUntil.entries()) {
+    	if (now >= disabledUntil) {
+    		this.proxyDisabledUntil.delete(proxyId);
+    		this.proxyConsecutiveNetworkErrors.delete(proxyId);
+    		recoveredProxies.push(proxyId);
+    		console.log(`\x1b[32m[ProxyManager] Proxy '${proxyId}' recovered and available again\x1b[0m`);
+    	}
+    }
+   
+    // For each recovered proxy, try to rebind accounts
+    for (const proxyId of recoveredProxies) {
+    	// First priority: accounts that have no usable proxy
+    	const accountWithoutProxy = this.findAccountWithoutUsableProxy();
+    	if (accountWithoutProxy) {
+    		this.accountProxyMapping.set(accountWithoutProxy, proxyId);
+    		console.log(`\x1b[36m[ProxyManager] Re-bound account '${accountWithoutProxy}' to recovered proxy '${proxyId}'\x1b[0m`);
+    		continue;
+    	}
+   
+    	// Second priority: activate skipped accounts
+    	if (this.skippedAccounts.length > 0) {
+    		this.activateSkippedAccount(proxyId);
+    	}
+    }
+   }
+   
+   /**
+    * Start periodic proxy recovery check
+    * @param {number} intervalMs - Interval in milliseconds (default: 60000)
+    */
+   startProxyRecoveryCheck(intervalMs) {
+    if (this.recoveryCheckInterval) {
+    	clearInterval(this.recoveryCheckInterval);
+    }
+   
+    const interval = intervalMs || this.recoveryCheckIntervalMs;
+    this.recoveryCheckInterval = setInterval(() => {
+    	this.checkAndRecoverProxies();
+    }, interval);
+   
+    console.log(`\x1b[36m[ProxyManager] Started proxy recovery check (every ${interval / 1000}s)\x1b[0m`);
+   }
+   
+   /**
+    * Stop periodic proxy recovery check
+    */
+   stopProxyRecoveryCheck() {
+    if (this.recoveryCheckInterval) {
+    	clearInterval(this.recoveryCheckInterval);
+    	this.recoveryCheckInterval = null;
+    	console.log(`\x1b[36m[ProxyManager] Stopped proxy recovery check\x1b[0m`);
+    }
+   }
+   }
+   
+   module.exports = { ProxyManager };
