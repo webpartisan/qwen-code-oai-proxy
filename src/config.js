@@ -61,7 +61,8 @@ module.exports = {
   // Proxy health configuration
   proxyConsecutiveNetworkErrors: parseInt(process.env.PROXY_CONSECUTIVE_NETWORK_ERRORS || '3', 10),
   badProxyCooldownMs: parseInt(process.env.BAD_PROXY_COOLDOWN_MS || '600000', 10),
-  
+  proxyRecoveryCheckIntervalMs: parseInt(process.env.PROXY_RECOVERY_CHECK_INTERVAL_MS || '60000', 10),
+ 
   // IP-based rate limit (requests per minute per proxy/IP)
   maxRequestsPerMinutePerIp: parseInt(process.env.MAX_REQUESTS_PER_MINUTE_PER_IP || '60'),
 
