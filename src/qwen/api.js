@@ -679,12 +679,17 @@ class QwenAPI {
 
     const signature = JSON.stringify(allAccountIds);
     if (this.lastBindingSignature === signature && this.proxyManager.hasBindings()) {
-      return;
+    	return;
     }
-
+   
     this.proxyManager.initializeBindings(allAccountIds);
     this.lastBindingSignature = signature;
-  }
+   
+    // Start proxy recovery check if not already started
+    if (!this.proxyManager.recoveryCheckInterval) {
+    	this.proxyManager.startProxyRecoveryCheck();
+    }
+   }
 
   /**
    * Build list of accounts to use for a request
@@ -833,25 +838,33 @@ class QwenAPI {
 
       // Handle rate limit errors (429) with exponential backoff
       if (isRateLimitError(error)) {
-        const errorMessage = error?.response?.data?.message || error?.message || 'Too Many Requests';
-        const statusCode = error?.response?.status || 429;
-        
-        // Get current rate limit counts for debugging
-        const accountCount = this.healthManager.getRateLimitCount(accountInfo.accountId);
-        const proxyId = this.proxyManager.getProxyForAccount(accountInfo.accountId);
-        const ipCount = proxyId ? this.proxyManager.getIpRateLimitCount(proxyId) : 0;
-        
-        console.log(`\x1b[33mRate limit hit for ${accountInfo.accountId}: ${statusCode} ${errorMessage} (account: ${accountCount}/${this.healthManager.rateLimitMax}, ip: ${ipCount}/${this.proxyManager.rateLimitMax})\x1b[0m`);
+      	const errorMessage = error?.response?.data?.message || error?.message || 'Too Many Requests';
+      	const statusCode = error?.response?.status || 429;
+      	const errorData = error?.response?.data;
+     
+      	// Get current rate limit counts for debugging
+      	const accountCount = this.healthManager.getRateLimitCount(accountInfo.accountId);
+      	const proxyId = this.proxyManager.getProxyForAccount(accountInfo.accountId);
+      	const ipCount = proxyId ? this.proxyManager.getIpRateLimitCount(proxyId) : 0;
+     
+      	console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Rate limit hit: ${statusCode} ${errorMessage} (account: ${accountCount}/${this.healthManager.rateLimitMax}, ip: ${ipCount}/${this.proxyManager.rateLimitMax})\x1b[0m`);
+      	let errorResponseStr;
+      	try {
+      		errorResponseStr = JSON.stringify(errorData || {message: errorMessage});
+      	} catch (e) {
+      		errorResponseStr = `{message: "${errorMessage}"}`;
+      	}
+      	console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Error response: ${errorResponseStr}\x1b[0m`);
         
         // Check if we've exhausted rate limit retries
         if (rateLimitRetryCount >= config.rateLimitMaxRetries) {
-          console.log(`\x1b[31mRate limit retries exhausted for ${accountInfo.accountId} after ${rateLimitRetryCount} attempts\x1b[0m`);
-          throw {
-            error,
-            countStrike: false,
-            locked: false,
-            isRateLimit: true
-          };
+        	console.log(`\x1b[31m[ACCOUNT ${accountInfo.accountId}] Rate limit retries exhausted after ${rateLimitRetryCount} attempts, switching to next account\x1b[0m`);
+        	throw {
+        		error,
+        		countStrike: false,
+        		locked: false,
+        		isRateLimit: true
+        	};
         }
         
         // Calculate exponential backoff delay: 2s, 4s, 8s, 16s, 32s
@@ -860,7 +873,7 @@ class QwenAPI {
         const jitter = Math.random() * 1000; // Add up to 1s jitter to prevent thundering herd
         const totalDelay = exponentialDelay + jitter;
         
-        console.log(`\x1b[36mWaiting ${Math.round(totalDelay)}ms before retry ${rateLimitRetryCount + 1}/${config.rateLimitMaxRetries} for ${accountInfo.accountId}\x1b[0m`);
+        console.log(`\x1b[36m[ACCOUNT ${accountInfo.accountId}] Waiting ${Math.round(totalDelay)}ms before retry ${rateLimitRetryCount + 1}/${config.rateLimitMaxRetries}\x1b[0m`);
         await this.sleep(totalDelay);
         
         // Retry with the same account
@@ -946,11 +959,13 @@ class QwenAPI {
           attemptsUsed += 1;
           attemptsByAccount.set(candidate.accountId, (attemptsByAccount.get(candidate.accountId) || 0) + 1);
 
-          console.log(`\x1b[36mSelected account for request attempt: ${candidate.accountId}\x1b[0m`);
+          const proxyId = this.proxyManager.getProxyForAccount(candidate.accountId);
+          console.log(`\x1b[36mSelected account for request attempt: ${candidate.accountId} (proxy: ${proxyId || 'none'})\x1b[0m`);
           const result = await this.executeOperationWithAccount(candidate, executeAttempt);
           attemptedRequest = true;
           await onSuccess(candidate.accountId, result);
           this.healthManager.resetStrikes(candidate.accountId);
+          console.log(`\x1b[32m[ACCOUNT ${candidate.accountId}] Request successful (proxy: ${proxyId || 'none'})\x1b[0m`);
           return result;
         } catch (outcome) {
           if (outcome.locked) {
@@ -969,32 +984,58 @@ class QwenAPI {
 
           // Handle rate limit errors - don't add strikes, just try next account
           if (outcome.isRateLimit) {
-            console.log(`\x1b[33mAccount ${candidate.accountId} rate limited, trying next account...\x1b[0m`);
-            break;
+          	let errorDetails;
+          	try {
+          		errorDetails = outcome.error?.response?.data ? JSON.stringify(outcome.error.response.data) : (outcome.error?.message || 'no details');
+          	} catch (e) {
+          		errorDetails = outcome.error?.message || 'no details (circular structure)';
+          	}
+          	console.log(`\x1b[33m[ACCOUNT ${candidate.accountId}] Rate limited, trying next account... Details: ${errorDetails}\x1b[0m`);
+          	break;
           }
-
+         
           // Handle no usable proxy route - don't add strikes, just try next account
           if (outcome.isNoUsableProxyRoute) {
-            console.warn(`\x1b[33mAccount ${candidate.accountId} currently has no usable proxy route, trying next account...\x1b[0m`);
-            break;
+          	console.warn(`\x1b[33m[ACCOUNT ${candidate.accountId}] No usable proxy route, trying next account...\x1b[0m`);
+          	break;
           }
-
+         
           // Handle proxy/network transport errors - don't add strikes, just try next account
           if (outcome.isProxyNetworkError) {
-            console.warn(`\x1b[33mAccount ${candidate.accountId} hit a proxy/network transport error, trying next account...\x1b[0m`);
-            break;
+          	console.warn(`\x1b[33m[ACCOUNT ${candidate.accountId}] Proxy/network transport error, trying next account...\x1b[0m`);
+          	break;
           }
-
+         
           // Handle quota exhaustion - the ONLY case that adds a strike
           if (outcome.isQuotaExceeded) {
-            const errorMessage = outcome.error?.response?.data?.message || outcome.error?.message || 'quota exceeded';
-            this.healthManager.addStrike(candidate.accountId, `quota exceeded: ${errorMessage}`);
-            console.warn(`\x1b[33mAccount ${candidate.accountId} hit quota exhaustion, strike added and trying next account...\x1b[0m`);
-            break;
+          	const errorMessage = outcome.error?.response?.data?.message || outcome.error?.message || 'quota exceeded';
+          	let errorDetails;
+          	try {
+          		errorDetails = outcome.error?.response?.data ? JSON.stringify(outcome.error.response.data) : errorMessage;
+          	} catch (e) {
+          		errorDetails = errorMessage;
+          	}
+          	this.healthManager.addStrike(candidate.accountId, `quota exceeded: ${errorMessage}`);
+          	console.warn(`\x1b[33m[ACCOUNT ${candidate.accountId}] Quota exhaustion (strike added), trying next account... Details: ${errorDetails}\x1b[0m`);
+          	break;
           }
 
           // Generic non-quota failures - no strike added
-          console.warn(`\x1b[33mAccount ${candidate.accountId} failed without quota exhaustion; no strike added.\x1b[0m ${outcome.error}`);
+          let genericErrorDetails;
+          try {
+          	if (outcome.error?.response?.data) {
+          		genericErrorDetails = JSON.stringify(outcome.error.response.data);
+          	} else if (outcome.error?.message) {
+          		genericErrorDetails = outcome.error.message;
+          	} else if (outcome?.message) {
+          		genericErrorDetails = outcome.message;
+          	} else {
+          		genericErrorDetails = 'unknown error';
+          	}
+          } catch (e) {
+          	genericErrorDetails = outcome.error?.message || outcome?.message || 'unknown error (circular structure)';
+          }
+          console.warn(`\x1b[33m[ACCOUNT ${candidate.accountId}] Failed without quota exhaustion; no strike added. Details: ${genericErrorDetails}\x1b[0m`);
           break;
         }
       }
