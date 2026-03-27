@@ -851,15 +851,13 @@ class QwenAPI {
       	const proxyId = this.proxyManager.getProxyForAccount(accountInfo.accountId);
       	const ipCount = proxyId ? this.proxyManager.getIpRateLimitCount(proxyId) : 0;
      
-      	console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Rate limit hit: ${statusCode} ${errorMessage} (account: ${accountCount}/${this.healthManager.rateLimitMax}, ip: ${ipCount}/${this.proxyManager.rateLimitMax})\x1b[0m`);
+      	console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Rate limit hit: ${statusCode} (account: ${accountCount}/${this.healthManager.rateLimitMax}, ip: ${ipCount}/${this.proxyManager.rateLimitMax})\x1b[0m`);
       	
-      	// Log detailed error info from server response
+      	// Log detailed error info from server response in one line
       	if (errorCode) {
-      		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Error code: ${errorCode}${errorType ? `, type: ${errorType}` : ''}\x1b[0m`);
-      	}
-      	
-      	if (requestId) {
-      		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Request ID: ${requestId}\x1b[0m`);
+      		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Server error: code="${errorCode}"${errorType ? `, type="${errorType}"` : ''}, message="${errorMessage}"${requestId ? `, request_id="${requestId}"` : ''}\x1b[0m`);
+      	} else {
+      		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Error message: "${errorMessage}"${requestId ? `, request_id="${requestId}"` : ''}\x1b[0m`);
       	}
         
         // Check if we've exhausted rate limit retries
