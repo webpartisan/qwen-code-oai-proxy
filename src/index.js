@@ -206,34 +206,51 @@ class QwenOpenAIProxy {
 
       let qwenId = null;
       let buffer = '';
-      
+      let totalInputTokens = 0;
+      let totalOutputTokens = 0;
+     
       stream.on('data', (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        
-        for (const line of lines) {
-          if (line.startsWith('data: ') && !qwenId) {
-            const data = line.slice(6);
-            if (data !== '[DONE]') {
-              try {
-                const json = JSON.parse(data);
-                if (json.id) {
-                  qwenId = json.id.replace('chatcmpl-', '');
-                }
-              } catch (e) {}
-            }
-          }
-        }
-        
-        res.write(chunk);
+      	buffer += chunk.toString();
+      	const lines = buffer.split('\n');
+      	buffer = lines.pop() || '';
+     
+      	for (const line of lines) {
+      		if (line.startsWith('data: ')) {
+      			const data = line.slice(6);
+      			if (data !== '[DONE]') {
+      				try {
+      					const json = JSON.parse(data);
+      					if (json.id && !qwenId) {
+      						qwenId = json.id.replace('chatcmpl-', '');
+      					}
+      					// Extract usage from the final chunk
+      					if (json.usage) {
+      						totalInputTokens = json.usage.prompt_tokens || 0;
+      						totalOutputTokens = json.usage.completion_tokens || 0;
+      					}
+      				} catch (e) {}
+      			}
+      		}
+      	}
+     
+      	res.write(chunk);
       });
-      
-      stream.on('end', () => {
-        const latency = Date.now() - startTime;
-        const qwenIdShort = qwenId ? qwenId.substring(0, 8) : null;
-        liveLogger.proxyResponse(requestId, 200, displayAccount, latency, 0, 0, qwenIdShort);
-        res.end();
+     
+      stream.on('end', async () => {
+      	const latency = Date.now() - startTime;
+      	const qwenIdShort = qwenId ? qwenId.substring(0, 8) : null;
+      	liveLogger.proxyResponse(requestId, 200, displayAccount, latency, totalInputTokens, totalOutputTokens, qwenIdShort);
+      	
+      	// Record token usage for streaming requests
+      	if (totalInputTokens > 0 || totalOutputTokens > 0) {
+      		try {
+      			await qwenAPI.recordTokenUsage(accountId || 'default', totalInputTokens, totalOutputTokens);
+      		} catch (e) {
+      			console.error('Failed to record token usage:', e.message);
+      		}
+      	}
+      	
+      	res.end();
       });
       
       stream.on('error', (error) => {
