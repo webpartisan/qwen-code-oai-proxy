@@ -838,9 +838,13 @@ class QwenAPI {
 
       // Handle rate limit errors (429) with exponential backoff
       if (isRateLimitError(error)) {
-      	const errorMessage = error?.response?.data?.message || error?.message || 'Too Many Requests';
+      	// Try to get error data from various locations (streaming vs regular)
+      	const errorData = error?.responseData || error?.response?.data;
+      	const errorMessage = errorData?.error?.message || errorData?.message || error?.message || 'Too Many Requests';
       	const statusCode = error?.response?.status || 429;
-      	const errorData = error?.response?.data;
+      	const errorCode = errorData?.error?.code || errorData?.code;
+      	const errorType = errorData?.error?.type || errorData?.type;
+      	const requestId = errorData?.request_id;
      
       	// Get current rate limit counts for debugging
       	const accountCount = this.healthManager.getRateLimitCount(accountInfo.accountId);
@@ -848,13 +852,26 @@ class QwenAPI {
       	const ipCount = proxyId ? this.proxyManager.getIpRateLimitCount(proxyId) : 0;
      
       	console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Rate limit hit: ${statusCode} ${errorMessage} (account: ${accountCount}/${this.healthManager.rateLimitMax}, ip: ${ipCount}/${this.proxyManager.rateLimitMax})\x1b[0m`);
-      	let errorResponseStr;
-      	try {
-      		errorResponseStr = JSON.stringify(errorData || {message: errorMessage});
-      	} catch (e) {
-      		errorResponseStr = `{message: "${errorMessage}"}`;
+      	
+      	// Log detailed error info from server response
+      	if (errorCode || errorType) {
+      		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Server error: code="${errorCode || 'N/A'}", type="${errorType || 'N/A'}"\x1b[0m`);
       	}
-      	console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Error response: ${errorResponseStr}\x1b[0m`);
+      	
+      	if (requestId) {
+      		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Request ID: ${requestId}\x1b[0m`);
+      	}
+      	
+      	// Log full response data if available
+      	if (errorData && Object.keys(errorData).length > 0) {
+      		let errorResponseStr;
+      		try {
+      			errorResponseStr = JSON.stringify(errorData, null, 2);
+      		} catch (e) {
+      			errorResponseStr = `{message: "${errorMessage}"}`;
+      		}
+      		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Full server response: ${errorResponseStr}\x1b[0m`);
+      	}
         
         // Check if we've exhausted rate limit retries
         if (rateLimitRetryCount >= config.rateLimitMaxRetries) {
@@ -1181,39 +1198,116 @@ class QwenAPI {
   }
 
   async processStreamingRequestWithAccount(request, accountInfo) {
-    const { credentials } = accountInfo;
-    const apiEndpoint = await this.getApiEndpoint(credentials);
-    const url = `${apiEndpoint}/chat/completions`;
-    const model = resolveModelAlias(request.model) || DEFAULT_MODEL;
-    const processedMessages = processMessagesForVision(request.messages, model);
-    const maxTokens = clampMaxTokens(model, request.max_tokens);
-    const payload = {
-      model,
-      messages: processedMessages,
-      temperature: request.temperature,
-      max_tokens: maxTokens,
-      top_p: request.top_p,
-      top_k: request.top_k,
-      repetition_penalty: request.repetition_penalty,
-      tools: request.tools,
-      tool_choice: request.tool_choice,
-      reasoning: request.reasoning,
-      stream: true,
-      stream_options: { include_usage: true }
-    };
-    const headers = buildDashScopeHeaders(credentials.access_token, true);
-    const stream = new PassThrough();
-
-    const networkConfig = this.getAxiosConfigForAccount(accountInfo.accountId, { stream: true });
-
-    const response = await axios.post(url, payload, {
-      headers,
-      timeout: 300000,
-      ...networkConfig,
-    });
-
-    response.data.pipe(stream);
-    return stream;
+  	const { credentials } = accountInfo;
+  	const apiEndpoint = await this.getApiEndpoint(credentials);
+  	const url = `${apiEndpoint}/chat/completions`;
+  	const model = resolveModelAlias(request.model) || DEFAULT_MODEL;
+  	const processedMessages = processMessagesForVision(request.messages, model);
+  	const maxTokens = clampMaxTokens(model, request.max_tokens);
+  	const payload = {
+  		model,
+  		messages: processedMessages,
+  		temperature: request.temperature,
+  		max_tokens: maxTokens,
+  		top_p: request.top_p,
+  		top_k: request.top_k,
+  		repetition_penalty: request.repetition_penalty,
+  		tools: request.tools,
+  		tool_choice: request.tool_choice,
+  		reasoning: request.reasoning,
+  		stream: true,
+  		stream_options: { include_usage: true }
+  	};
+  	const headers = buildDashScopeHeaders(credentials.access_token, true);
+  	const stream = new PassThrough();
+ 
+  	const networkConfig = this.getAxiosConfigForAccount(accountInfo.accountId, { stream: true });
+ 
+  	try {
+  		const response = await axios.post(url, payload, {
+  			headers,
+  			timeout: 300000,
+  			...networkConfig,
+  		});
+ 
+  		response.data.pipe(stream);
+  		return stream;
+  	} catch (error) {
+  		// Enhance error with full response data for streaming requests
+  		if (error.response) {
+  			console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Streaming request failed with status ${error.response.status}\x1b[0m`);
+  			
+  			// Try to extract error data safely
+  			let errorData = null;
+  			try {
+  				const data = error.response.data;
+  				
+  				// Check if data is a stream (IncomingMessage)
+  				if (data && typeof data.on === 'function') {
+  					// It's a stream - read error data from it
+  					const chunks = [];
+  					try {
+  						// Try to read synchronously (data might already be buffered)
+  						if (data.readable && data.readableLength > 0) {
+  							let chunk;
+  							while (null !== (chunk = data.read())) {
+  								chunks.push(chunk);
+  							}
+  						}
+  					} catch (readError) {
+  						// Ignore read errors
+  					}
+  					
+  					if (chunks.length > 0) {
+  						const content = Buffer.concat(chunks).toString('utf8');
+  						console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Stream error content: ${content.substring(0, 500)}\x1b[0m`);
+  						try {
+  							errorData = JSON.parse(content);
+  						} catch (e) {
+  							// Not JSON, but we have the content
+  						}
+  					} else {
+  						// No buffered data - need to handle async, but we're in sync context
+  						// Log status code and headers as fallback
+  						console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Status: ${error.response.status}, Headers: ${JSON.stringify(error.response.headers)}\x1b[0m`);
+  					}
+  				} else if (Buffer.isBuffer(data)) {
+  					// If data is a buffer, try to parse it as JSON
+  					const str = data.toString('utf8');
+  					console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Buffer content: ${str.substring(0, 500)}\x1b[0m`);
+  					try {
+  						errorData = JSON.parse(str);
+  					} catch (e) {
+  						console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Failed to parse buffer as JSON\x1b[0m`);
+  					}
+  				} else if (data && typeof data === 'object' && !data.on) {
+  					// Regular object
+  					errorData = {
+  						error: data.error ? {
+  							code: data.error.code,
+  							message: data.error.message,
+  							type: data.error.type
+  						} : undefined,
+  						message: data.message,
+  						code: data.code,
+  						type: data.type,
+  						request_id: data.request_id
+  					};
+  					Object.keys(errorData).forEach(key => {
+  						if (errorData[key] === undefined) delete errorData[key];
+  					});
+  				}
+  			} catch (e) {
+  				console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Error extracting response data: ${e.message}\x1b[0m`);
+  			}
+  			
+  			if (errorData && Object.keys(errorData).length > 0) {
+  				console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Server response: ${JSON.stringify(errorData, null, 2)}\x1b[0m`);
+  				error.responseData = errorData;
+  			}
+  		}
+  		throw error;
+  	}
   }
 
   /**
