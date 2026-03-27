@@ -854,23 +854,12 @@ class QwenAPI {
       	console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Rate limit hit: ${statusCode} ${errorMessage} (account: ${accountCount}/${this.healthManager.rateLimitMax}, ip: ${ipCount}/${this.proxyManager.rateLimitMax})\x1b[0m`);
       	
       	// Log detailed error info from server response
-      	if (errorCode || errorType) {
-      		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Server error: code="${errorCode || 'N/A'}", type="${errorType || 'N/A'}"\x1b[0m`);
+      	if (errorCode) {
+      		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Error code: ${errorCode}${errorType ? `, type: ${errorType}` : ''}\x1b[0m`);
       	}
       	
       	if (requestId) {
       		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Request ID: ${requestId}\x1b[0m`);
-      	}
-      	
-      	// Log full response data if available
-      	if (errorData && Object.keys(errorData).length > 0) {
-      		let errorResponseStr;
-      		try {
-      			errorResponseStr = JSON.stringify(errorData, null, 2);
-      		} catch (e) {
-      			errorResponseStr = `{message: "${errorMessage}"}`;
-      		}
-      		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Full server response: ${errorResponseStr}\x1b[0m`);
       	}
         
         // Check if we've exhausted rate limit retries
@@ -1235,9 +1224,7 @@ class QwenAPI {
   	} catch (error) {
   		// Enhance error with full response data for streaming requests
   		if (error.response) {
-  			console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Streaming request failed with status ${error.response.status}\x1b[0m`);
-  			
-  			// Try to extract error data safely
+  			// Try to extract error data safely (no logging here - done in executeOperationWithAccount)
   			let errorData = null;
   			try {
   				const data = error.response.data;
@@ -1260,25 +1247,20 @@ class QwenAPI {
   					
   					if (chunks.length > 0) {
   						const content = Buffer.concat(chunks).toString('utf8');
-  						console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Stream error content: ${content.substring(0, 500)}\x1b[0m`);
   						try {
   							errorData = JSON.parse(content);
   						} catch (e) {
-  							// Not JSON, but we have the content
+  							// Not JSON, use as plain message
+  							errorData = { message: content.substring(0, 200) };
   						}
-  					} else {
-  						// No buffered data - need to handle async, but we're in sync context
-  						// Log status code and headers as fallback
-  						console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Status: ${error.response.status}, Headers: ${JSON.stringify(error.response.headers)}\x1b[0m`);
   					}
   				} else if (Buffer.isBuffer(data)) {
   					// If data is a buffer, try to parse it as JSON
   					const str = data.toString('utf8');
-  					console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Buffer content: ${str.substring(0, 500)}\x1b[0m`);
   					try {
   						errorData = JSON.parse(str);
   					} catch (e) {
-  						console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Failed to parse buffer as JSON\x1b[0m`);
+  						errorData = { message: str.substring(0, 200) };
   					}
   				} else if (data && typeof data === 'object' && !data.on) {
   					// Regular object
@@ -1298,11 +1280,11 @@ class QwenAPI {
   					});
   				}
   			} catch (e) {
-  				console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Error extracting response data: ${e.message}\x1b[0m`);
+  				// Ignore extraction errors
   			}
   			
+  			// Attach extracted data to error for later use in executeOperationWithAccount
   			if (errorData && Object.keys(errorData).length > 0) {
-  				console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Server response: ${JSON.stringify(errorData, null, 2)}\x1b[0m`);
   				error.responseData = errorData;
   			}
   		}
