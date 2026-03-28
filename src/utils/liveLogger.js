@@ -27,9 +27,22 @@ function getAccountColor(accountId) {
 
 function formatAccountTag(accountId) {
   if (!accountId) return colors.cyan('[default]');
-  const id = accountId.substring(0, 8);
+  // Extract username part before @ for cleaner display
+  const username = accountId.includes('@') ? accountId.split('@')[0] : accountId;
+  const id = username.length > 8 ? username.substring(0, 8) : username;
   const color = getAccountColor(accountId);
   return colors[color](`[${id}]`);
+}
+
+function formatProxyTag(proxyId) {
+  if (!proxyId) return colors.gray('[direct]');
+  // Shorten proxy ID for display
+  const shortId = proxyId.length > 12 ? proxyId.substring(0, 12) : proxyId;
+  return colors.gray(`[${shortId}]`);
+}
+
+function formatAccountAndProxy(accountId, proxyId) {
+  return `${formatAccountTag(accountId)} ${formatProxyTag(proxyId)}`;
 }
 
 const customFormat = winston.format.printf(({ timestamp, level, message }) => {
@@ -64,52 +77,89 @@ function maskAccountId(accountId) {
 }
 
 const liveLogger = {
-  proxyRequest(requestId, model, accountId, tokenCount, requestNum, isStreaming) {
+  proxyRequest(requestId, model, accountId, tokenCount, requestNum, isStreaming, proxyId) {
     const reqNumStr = requestNum ? colors.gray(`#${requestNum}`) : '';
     const streamStr = isStreaming ? colors.cyan('{streaming}') : '';
-    const msg = `${colors.blue('→')} ${formatAccountTag(accountId)} ${colors.gray(requestId.substring(0, 8))} | ${colors.yellow(model)} ${streamStr} | ${colors.gray(`${tokenCount} tokens`)} ${reqNumStr}`;
+    // Show "inbound" for requests since account/proxy not yet determined
+    // Only show account if it's a real account (not 'default' or null)
+    const hasRealAccount = accountId && accountId !== 'default';
+    const accountInfo = hasRealAccount ? formatAccountTag(accountId) : colors.gray('[inbound]');
+    const proxyInfo = proxyId ? formatProxyTag(proxyId) : '';
+    const msg = `${colors.blue('→')} ${accountInfo}${proxyInfo} ${colors.gray(requestId.substring(0, 8))} | ${colors.yellow(model)} ${streamStr} | ${colors.gray(`${tokenCount} tokens`)} ${reqNumStr}`;
     log(msg);
   },
 
-  proxyResponse(requestId, statusCode, accountId, latency, inputTokens, outputTokens, qwenId) {
+  proxyResponse(requestId, statusCode, accountId, latency, inputTokens, outputTokens, qwenId, proxyId) {
     const statusColor = statusCode === 200 ? colors.green : colors.red;
-    const tokenInfo = inputTokens && outputTokens 
+    const tokenInfo = inputTokens && outputTokens
       ? ` | ${colors.cyan(`${inputTokens}+${outputTokens} tok`)}`
       : '';
     const shortId = requestId.length > 12 ? requestId.substring(0, 8) : requestId;
     const qwenInfo = qwenId ? ` | ${colors.magenta(`qwen: ${qwenId}`)}` : '';
-    const msg = `${colors.blue('←')} ${formatAccountTag(accountId)} ${colors.gray(shortId)} ${statusColor(statusCode)} | ${colors.gray(`${latency}ms`)}${tokenInfo}${qwenInfo}`;
+    const msg = `${colors.blue('←')} ${formatAccountAndProxy(accountId, proxyId)} ${colors.gray(shortId)} ${statusColor(statusCode)} | ${colors.gray(`${latency}ms`)}${tokenInfo}${qwenInfo}`;
     log(msg);
   },
 
-  proxyError(requestId, statusCode, accountId, errorMessage) {
-    const msg = `${colors.red('✗')} ${formatAccountTag(accountId)} ${colors.red(statusCode)} | ${colors.gray(errorMessage.substring(0, 50))}`;
+  proxyError(requestId, statusCode, accountId, errorMessage, proxyId) {
+    const msg = `${colors.red('✗')} ${formatAccountAndProxy(accountId, proxyId)} ${colors.red(statusCode)} | ${colors.gray(errorMessage.substring(0, 50))}`;
     log(msg);
   },
 
-  authInitiated(deviceCode) {
-    const msg = `${colors.green('✓')} Auth | ${colors.gray(`code: ${deviceCode}`)}`;
+  authInitiated(deviceCode, proxyId) {
+    const msg = `${colors.green('✓')} Auth ${formatProxyTag(proxyId)} | ${colors.gray(`code: ${deviceCode}`)}`;
     log(msg);
   },
 
-  authCompleted(accountId) {
-    const msg = `${colors.green('✓')} Auth done | ${colors.cyan(maskAccountId(accountId))}`;
+  authCompleted(accountId, proxyId) {
+    const msg = `${colors.green('✓')} Auth done ${formatAccountAndProxy(accountId, proxyId)}`;
     log(msg);
   },
 
-  accountRefreshed(accountId, status) {
+  accountRefreshed(accountId, status, proxyId) {
     const statusMsg = status === 'healthy' ? colors.green('ok') : colors.red('fail');
-    const msg = `${colors.blue('↻')} Refresh | ${colors.cyan(maskAccountId(accountId))} | ${statusMsg}`;
+    const msg = `${colors.blue('↻')} Refresh ${formatAccountAndProxy(accountId, proxyId)} | ${statusMsg}`;
     log(msg);
   },
 
-  accountAdded(accountId) {
-    const msg = `${colors.green('+')} Account | ${colors.cyan(maskAccountId(accountId))}`;
+  accountAdded(accountId, proxyId) {
+    const msg = `${colors.green('+')} Account ${formatAccountAndProxy(accountId, proxyId)}`;
     log(msg);
   },
 
   accountRemoved(accountId) {
     const msg = `${colors.red('-')} Account | ${colors.cyan(maskAccountId(accountId))}`;
+    log(msg);
+  },
+
+  // Token refresh specific logging
+  tokenRefreshStart(accountId, proxyId) {
+    const msg = `${colors.yellow('⟳')} Token refresh ${formatAccountAndProxy(accountId, proxyId)} | ${colors.yellow('starting...')}`;
+    log(msg);
+  },
+
+  tokenRefreshSuccess(accountId, proxyId, latency) {
+    const msg = `${colors.green('✓')} Token refresh ${formatAccountAndProxy(accountId, proxyId)} | ${colors.green('success')} ${colors.gray(`${latency}ms`)}`;
+    log(msg);
+  },
+
+  tokenRefreshError(accountId, proxyId, errorMessage) {
+    const msg = `${colors.red('✗')} Token refresh ${formatAccountAndProxy(accountId, proxyId)} | ${colors.red('failed')} ${colors.gray(errorMessage.substring(0, 50))}`;
+    log(msg);
+  },
+
+  // OAuth device flow logging
+  oauthDeviceCodeRequest(proxyId) {
+    const msg = `${colors.blue('→')} OAuth ${formatProxyTag(proxyId)} | ${colors.gray('requesting device code...')}`;
+    log(msg);
+  },
+
+  oauthDeviceCodeSuccess(proxyId, deviceCode) {
+    const msg = `${colors.green('✓')} OAuth ${formatProxyTag(proxyId)} | ${colors.gray(`device code: ${deviceCode.substring(0, 8)}...`)}`;
+    log(msg);
+  },
+
+  oauthTokenPoll(proxyId, attempt, maxAttempts) {
+    const msg = `${colors.yellow('⟳')} OAuth ${formatProxyTag(proxyId)} | ${colors.gray(`polling ${attempt}/${maxAttempts}...`)}`;
     log(msg);
   },
 
