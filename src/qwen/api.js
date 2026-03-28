@@ -327,22 +327,25 @@ class QwenAPI {
     this.tokenUsage = new Map();
     this.lastResetDate = new Date().toISOString().split('T')[0];
     this.requestCountFile = path.join(this.authManager.qwenDir, 'request_counts.json');
-    
+
     this.lastSaveTime = 0;
     this.saveInterval = 60000;
     this.pendingSave = false;
-    
+
     this.accountLocks = new Map();
     this.accountQueues = new Map();
-    
+
     this.webSearchRequestCounts = new Map();
     this.webSearchResultCounts = new Map();
-    
+
     this.healthManager = new AccountHealthManager(this.authManager.qwenDir, config.maxRequestsPerMinute);
     this.proxyManager = new ProxyManager(config);
-    
+
+    // Pass proxy manager to auth manager for OAuth requests
+    this.authManager.setProxyManager(this.proxyManager);
+
     this.lastBindingSignature = null;
-    
+
     this.loadRequestCounts();
   }
 
@@ -767,6 +770,15 @@ class QwenAPI {
   }
 
   /**
+   * Get the proxy ID for an account
+   * @param {string} accountId - The account ID
+   * @returns {string|null} The proxy ID or null if not found
+   */
+  getProxyForAccount(accountId) {
+    return this.proxyManager.getProxyForAccount(accountId);
+  }
+
+  /**
    * Normalize an operation error into a standardized outcome object
    * @param {Object} accountInfo - The account info
    * @param {Error} error - The error that occurred
@@ -1086,6 +1098,10 @@ class QwenAPI {
     await this.refreshAccountProxyBindings();
     const configuredAccounts = this.buildAccountList(request);
 
+    // Reset last used account info
+    this._lastUsedAccountId = null;
+    this._lastUsedProxyId = null;
+
     return await this.executeWithAccountRotation(
       configuredAccounts,
       async (accountInfo) => {
@@ -1093,6 +1109,10 @@ class QwenAPI {
         return this.processRequestWithAccount(request, accountInfo);
       },
       async (accountId, response) => {
+        // Store the account and proxy used for this request
+        this._lastUsedAccountId = accountId;
+        this._lastUsedProxyId = this.proxyManager.getProxyForAccount(accountId);
+
         await this.incrementRequestCount(accountId);
         this.healthManager.incrementAccountRateLimit(accountId);
         this.handleSuccessfulProxyUsage(accountId);
@@ -1106,6 +1126,22 @@ class QwenAPI {
         }
       }
     );
+  }
+
+  /**
+   * Get the last used account ID from the most recent request
+   * @returns {string|null} The account ID or null
+   */
+  getLastUsedAccountId() {
+    return this._lastUsedAccountId;
+  }
+
+  /**
+   * Get the last used proxy ID from the most recent request
+   * @returns {string|null} The proxy ID or null
+   */
+  getLastUsedProxyId() {
+    return this._lastUsedProxyId;
   }
 
   async processRequestWithAccount(request, accountInfo) {
@@ -1301,6 +1337,10 @@ class QwenAPI {
     await this.refreshAccountProxyBindings();
     const configuredAccounts = this.buildAccountList(request);
 
+    // Reset last used account info
+    this._lastUsedAccountId = null;
+    this._lastUsedProxyId = null;
+
     return await this.executeWithAccountRotation(
       configuredAccounts,
       async (accountInfo) => {
@@ -1308,6 +1348,10 @@ class QwenAPI {
         return this.processStreamingRequestWithAccount(request, accountInfo);
       },
       async (accountId) => {
+        // Store the account and proxy used for this request
+        this._lastUsedAccountId = accountId;
+        this._lastUsedProxyId = this.proxyManager.getProxyForAccount(accountId);
+
         await this.incrementRequestCount(accountId);
         this.healthManager.incrementAccountRateLimit(accountId);
         this.handleSuccessfulProxyUsage(accountId);
@@ -1324,6 +1368,10 @@ class QwenAPI {
     await this.refreshAccountProxyBindings();
     const configuredAccounts = this.buildAccountList(request);
 
+    // Reset last used account info
+    this._lastUsedAccountId = null;
+    this._lastUsedProxyId = null;
+
     return await this.executeWithAccountRotation(
       configuredAccounts,
       async (accountInfo) => {
@@ -1331,6 +1379,10 @@ class QwenAPI {
         return this.processWebSearchWithAccount(request, accountInfo);
       },
       async (accountId, response) => {
+        // Store the account and proxy used for this request
+        this._lastUsedAccountId = accountId;
+        this._lastUsedProxyId = this.proxyManager.getProxyForAccount(accountId);
+
         await this.incrementWebSearchRequestCount(accountId);
         this.healthManager.incrementAccountRateLimit(accountId);
         this.handleSuccessfulProxyUsage(accountId);
