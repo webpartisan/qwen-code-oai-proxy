@@ -964,12 +964,14 @@ class QwenAPI {
           attemptsByAccount.set(candidate.accountId, (attemptsByAccount.get(candidate.accountId) || 0) + 1);
 
           const proxyId = this.proxyManager.getProxyForAccount(candidate.accountId);
-          console.log(`\x1b[36mSelected account for request attempt: ${candidate.accountId} (proxy: ${proxyId || 'none'})\x1b[0m`);
+          const proxyUrl = proxyId ? this.proxyManager.getProxyUrl(proxyId) : null;
+          const proxyInfo = proxyUrl ? `${proxyId} → ${proxyUrl}` : (proxyId || 'local');
+          console.log(`\x1b[36mSelected account for request attempt: ${candidate.accountId} (proxy: ${proxyInfo})\x1b[0m`);
           const result = await this.executeOperationWithAccount(candidate, executeAttempt);
           attemptedRequest = true;
           await onSuccess(candidate.accountId, result);
           this.healthManager.resetStrikes(candidate.accountId);
-          console.log(`\x1b[32m[ACCOUNT ${candidate.accountId}] Request successful (proxy: ${proxyId || 'none'})\x1b[0m`);
+          console.log(`\x1b[32m[ACCOUNT ${candidate.accountId}] Request successful (proxy: ${proxyInfo})\x1b[0m`);
           return result;
         } catch (outcome) {
           if (outcome.locked) {

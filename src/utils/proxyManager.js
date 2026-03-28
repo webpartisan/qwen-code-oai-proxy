@@ -586,7 +586,9 @@ class ProxyManager {
 
     for (const accountId of usableAccountIds) {
       const proxyId = this.accountProxyMapping.get(accountId);
-      lines.push(`${accountId} -> ${proxyId}`);
+      const proxyUrl = this.getProxyUrl(proxyId);
+      const proxyDisplay = proxyUrl ? `${proxyId} (${proxyUrl})` : proxyId;
+      lines.push(`${accountId} -> ${proxyDisplay}`);
     }
 
     if (skippedAccounts.length > 0) {
