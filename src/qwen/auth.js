@@ -1,9 +1,10 @@
 const path = require('path');
 const { promises: fs } = require('fs');
-const { fetch } = require('undici');
+const axios = require('axios');
 const crypto = require('crypto');
 const open = require('open');
 const qrcode = require('qrcode-terminal');
+const liveLogger = require('../utils/liveLogger.js');
 // File System Configuration
 const QWEN_DIR = '.qwen';
 const QWEN_CREDENTIAL_FILENAME = 'oauth_creds.json';
@@ -57,10 +58,48 @@ class QwenAuthManager {
     this.accounts = new Map(); // For multi-account-support (email -> credentials)
     this.currentAccountIndex = 0; // For round-robin account selection
     this.accountsHaveBeenLoaded = false; // Track if accounts were already loaded to avoid verbose logging
+    this.proxyManager = null; // ProxyManager for OAuth requests
   }
 
   init(qwenAPI) {
     this.qwenAPI = qwenAPI;
+  }
+
+  /**
+   * Set the proxy manager for OAuth requests
+   * @param {ProxyManager} proxyManager - The proxy manager instance
+   */
+  setProxyManager(proxyManager) {
+    this.proxyManager = proxyManager;
+  }
+
+  /**
+   * Get axios config for OAuth requests, using proxy if available
+   * @param {string} accountId - Optional account ID to get account-specific proxy
+   * @returns {Object} Object with { config, proxyId }
+   */
+  getOAuthAxiosConfig(accountId = null) {
+    // If no proxy manager or no configured proxies, use direct connection
+    if (!this.proxyManager || !this.proxyManager.hasConfiguredProxyList) {
+      return { config: {}, proxyId: null };
+    }
+
+    // Get proxy for account (or default proxy)
+    let proxyId;
+    if (accountId && this.proxyManager.accountProxyMapping.has(accountId)) {
+      proxyId = this.proxyManager.getProxyForAccount(accountId);
+    } else {
+      // Use first available proxy for OAuth if no account-specific binding
+      proxyId = this.proxyManager.availableProxies[0];
+    }
+
+    if (!proxyId) {
+      return { config: {}, proxyId: null };
+    }
+
+    // Get axios network config from proxy manager
+    const config = this.proxyManager.getAxiosNetworkConfig(proxyId, { stream: false });
+    return { config, proxyId };
   }
 
   async loadCredentials() {
@@ -262,9 +301,7 @@ class QwenAuthManager {
     }
   }
 
-  async refreshAccessToken(credentials) {
-    console.log('\x1b[33m%s\x1b[0m', 'Refreshing Qwen access token...');
-    
+  async refreshAccessToken(credentials, accountId = null) {
     if (!credentials || !credentials.refresh_token) {
       throw new Error('No refresh token available. Please re-authenticate with the Qwen CLI.');
     }
@@ -275,22 +312,23 @@ class QwenAuthManager {
       client_id: QWEN_OAUTH_CLIENT_ID,
     });
 
+    // Get axios config with proxy support
+    const { config: axiosConfig, proxyId } = this.getOAuthAxiosConfig(accountId);
+
+    // Log token refresh start
+    liveLogger.tokenRefreshStart(accountId, proxyId);
+    const startTime = Date.now();
+
     try {
-      const response = await fetch(QWEN_OAUTH_TOKEN_ENDPOINT, {
-        method: 'POST',
+      const response = await axios.post(QWEN_OAUTH_TOKEN_ENDPOINT, bodyData.toString(), {
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           Accept: 'application/json',
         },
-        body: bodyData,
+        ...axiosConfig,
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(`Token refresh failed: ${errorData.error} - ${errorData.error_description}`);
-      }
-
-      const tokenData = await response.json();
+      const tokenData = response.data;
       const newCredentials = {
         ...credentials,
         access_token: tokenData.access_token,
@@ -300,10 +338,14 @@ class QwenAuthManager {
         expiry_date: Date.now() + tokenData.expires_in * 1000,
       }
 
-      console.log('\x1b[32m%s\x1b[0m', 'Qwen access token refreshed successfully');
+      // Log token refresh success
+      const latency = Date.now() - startTime;
+      liveLogger.tokenRefreshSuccess(accountId, proxyId, latency);
       return newCredentials;
     } catch (error) {
-      console.error('\x1b[31m%s\x1b[0m', 'Failed to refresh Qwen access token with error:', error.message);
+      const errorMsg = error.response?.data?.error_description || error.response?.data?.error || error.message;
+      // Log token refresh error
+      liveLogger.tokenRefreshError(accountId, proxyId, errorMsg);
       // If refresh fails, the user likely needs to re-auth completely.
       throw new Error('Failed to refresh access token. Please re-authenticate with the Qwen CLI.');
     }
@@ -367,21 +409,21 @@ class QwenAuthManager {
     // Acquire account lock to prevent concurrent refreshes
     const lockAcquired = await this.qwenAPI.acquireAccountLock(accountId);
     if (!lockAcquired) {
-      throw new Error(accountId ? 
-        `Account ${accountId} is currently in use, cannot refresh token now` : 
+      throw new Error(accountId ?
+        `Account ${accountId} is currently in use, cannot refresh token now` :
         'Default account is currently in use, cannot refresh token now');
     }
 
     try {
-      const newCredentials = await this.refreshAccessToken(credentials);
-      
+      const newCredentials = await this.refreshAccessToken(credentials, accountId);
+
       // Save to the appropriate account
       if (accountId) {
         await this.saveCredentials(newCredentials, accountId);
       } else {
         await this.saveCredentials(newCredentials);
       }
-      
+
       return newCredentials;
     } catch (error) {
       throw new Error(`${error instanceof Error ? error.message : String(error)}`);
@@ -500,7 +542,7 @@ class QwenAuthManager {
     return credentials && this.isTokenValid(credentials);
   }
 
-  async initiateDeviceFlow() {
+  async initiateDeviceFlow(accountId = null) {
     // Generate PKCE code verifier and challenge
     const { code_verifier, code_challenge } = generatePKCEPair();
 
@@ -511,27 +553,30 @@ class QwenAuthManager {
       code_challenge_method: 'S256',
     });
 
+    // Get axios config with proxy support
+    const { config: axiosConfig, proxyId } = this.getOAuthAxiosConfig(accountId);
+
+    // Log OAuth device code request
+    liveLogger.oauthDeviceCodeRequest(proxyId);
+
     try {
-      const response = await fetch(QWEN_OAUTH_DEVICE_CODE_ENDPOINT, {
-        method: 'POST',
+      const response = await axios.post(QWEN_OAUTH_DEVICE_CODE_ENDPOINT, bodyData.toString(), {
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           Accept: 'application/json',
         },
-        body: bodyData,
+        ...axiosConfig,
       });
 
-      if (!response.ok) {
-        const errorData = await response.text();
-        throw new Error(`Device authorization failed: ${response.status} ${response.statusText}. Response: ${errorData}`);
-      }
+      const result = response.data;
 
-      const result = await response.json();
-      
       // Check if the response indicates success
       if (!result.device_code) {
         throw new Error(`Device authorization failed: ${result.error || 'Unknown error'} - ${result.error_description || 'No details provided'}`);
       }
+
+      // Log OAuth device code success
+      liveLogger.oauthDeviceCodeSuccess(proxyId, result.device_code);
 
       // Add the code_verifier to the result so it can be used later for polling
       return {
@@ -539,7 +584,8 @@ class QwenAuthManager {
         code_verifier: code_verifier
       };
     } catch (error) {
-      console.error('Device authorization flow failed:', error.message);
+      const errorMsg = error.response?.data || error.message;
+      liveLogger.tokenRefreshError(accountId, proxyId, `Device auth failed: ${errorMsg}`);
       throw error;
     }
   }
@@ -547,6 +593,9 @@ class QwenAuthManager {
   async pollForToken(device_code, code_verifier, accountId = null) {
     let pollInterval = 5000; // 5 seconds
     const maxAttempts = 60; // 5 minutes max
+
+    // Get axios config with proxy support (use same config for all polling requests)
+    const { config: axiosConfig, proxyId } = this.getOAuthAxiosConfig(accountId);
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const bodyData = new URLSearchParams({
@@ -556,56 +605,51 @@ class QwenAuthManager {
         code_verifier: code_verifier,
       });
 
+      // Log polling attempt
+      liveLogger.oauthTokenPoll(proxyId, attempt + 1, maxAttempts);
+
       try {
-        const response = await fetch(QWEN_OAUTH_TOKEN_ENDPOINT, {
-          method: 'POST',
+        const response = await axios.post(QWEN_OAUTH_TOKEN_ENDPOINT, bodyData.toString(), {
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
             Accept: 'application/json',
           },
-          body: bodyData,
+          validateStatus: () => true, // Don't throw on any status code
+          ...axiosConfig,
         });
 
-        if (!response.ok) {
-          // Parse the response as JSON to check for OAuth RFC 8628 standard errors
-          try {
-            const errorData = await response.json();
+        // Check for error status codes
+        if (response.status !== 200) {
+          const errorData = response.data;
 
-            // According to OAuth RFC 8628, handle standard polling responses
-            if (response.status === 400 && errorData.error === 'authorization_pending') {
-              // User has not yet approved the authorization request. Continue polling.
-              console.log(`Polling attempt ${attempt + 1}/${maxAttempts}...`);
-              await new Promise(resolve => setTimeout(resolve, pollInterval));
-              continue;
-            }
-
-            if (response.status === 400 && errorData.error === 'slow_down') {
-              // Client is polling too frequently. Increase poll interval.
-              pollInterval = Math.min(pollInterval * 1.5, 10000); // Increase by 50%, max 10 seconds
-              console.log(`Server requested to slow down, increasing poll interval to ${pollInterval}ms`);
-              await new Promise(resolve => setTimeout(resolve, pollInterval));
-              continue;
-            }
-
-            if (response.status === 400 && errorData.error === 'expired_token') {
-              throw new Error('Device code expired. Please restart the authentication process.');
-            }
-
-            if (response.status === 400 && errorData.error === 'access_denied') {
-              throw new Error('Authorization denied by user. Please restart the authentication process.');
-            }
-
-            // For other errors, throw with proper error information
-            throw new Error(`Device token poll failed: ${errorData.error || 'Unknown error'} - ${errorData.error_description || 'No details provided'}`);
-          } catch (_parseError) {
-            // If JSON parsing fails, fall back to text response
-            const errorData = await response.text();
-            throw new Error(`Device token poll failed: ${response.status} ${response.statusText}. Response: ${errorData}`);
+          // According to OAuth RFC 8628, handle standard polling responses
+          if (response.status === 400 && errorData.error === 'authorization_pending') {
+            // User has not yet approved the authorization request. Continue polling.
+            await new Promise(resolve => setTimeout(resolve, pollInterval));
+            continue;
           }
+
+          if (response.status === 400 && errorData.error === 'slow_down') {
+            // Client is polling too frequently. Increase poll interval.
+            pollInterval = Math.min(pollInterval * 1.5, 10000); // Increase by 50%, max 10 seconds
+            await new Promise(resolve => setTimeout(resolve, pollInterval));
+            continue;
+          }
+
+          if (response.status === 400 && errorData.error === 'expired_token') {
+            throw new Error('Device code expired. Please restart the authentication process.');
+          }
+
+          if (response.status === 400 && errorData.error === 'access_denied') {
+            throw new Error('Authorization denied by user. Please restart the authentication process.');
+          }
+
+          // For other errors, throw with proper error information
+          throw new Error(`Device token poll failed: ${errorData.error || 'Unknown error'} - ${errorData.error_description || 'No details provided'}`);
         }
 
-        const tokenData = await response.json();
-        
+        const tokenData = response.data;
+
         // Convert to QwenCredentials format and save
         const credentials = {
           access_token: tokenData.access_token,
@@ -616,21 +660,23 @@ class QwenAuthManager {
         };
 
         await this.saveCredentials(credentials, accountId);
-        
+
+        // Log auth completed
+        liveLogger.authCompleted(accountId, proxyId);
+
         return credentials;
       } catch (error) {
         // Handle specific error cases
         const errorMessage = error instanceof Error ? error.message : String(error);
-        
+
         // If we get a specific OAuth error that should stop polling, throw it
-        if (errorMessage.includes('expired_token') || 
-            errorMessage.includes('access_denied') || 
+        if (errorMessage.includes('expired_token') ||
+            errorMessage.includes('access_denied') ||
             errorMessage.includes('Device authorization failed')) {
           throw error;
         }
-        
+
         // For other errors, continue polling
-        console.log(`Polling attempt ${attempt + 1}/${maxAttempts} failed:`, errorMessage);
         await new Promise(resolve => setTimeout(resolve, pollInterval));
       }
     }
