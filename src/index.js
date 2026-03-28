@@ -62,12 +62,13 @@ class QwenOpenAIProxy {
     const displayAccount = accountId ? accountId.substring(0, 8) : 'default';
     const requestNum = qwenAPI.getRequestCount(accountId || 'default');
     const isStreaming = req.body.stream === true;
-    
+
     try {
       const tokenCount = countTokens(req.body.messages);
-      
-      liveLogger.proxyRequest(requestId, model, displayAccount, tokenCount, requestNum, isStreaming);
-      
+
+      // Log request without proxy (proxy will be determined during execution)
+      liveLogger.proxyRequest(requestId, model, displayAccount, tokenCount, requestNum, isStreaming, null);
+
       if (isStreaming) {
         await this.handleStreamingChatCompletion(req, res, requestId, accountId, model, startTime);
       } else {
@@ -75,7 +76,7 @@ class QwenOpenAIProxy {
       }
     } catch (error) {
       if (error.message.includes('Validation error')) {
-        liveLogger.proxyError(requestId, 400, displayAccount, error.message);
+        liveLogger.proxyError(requestId, 400, displayAccount, error.message, proxyId);
         const validationError = ErrorFormatter.openAIValidationError(error.message);
         return res.status(validationError.status).json(validationError.body);
       }
@@ -106,7 +107,7 @@ class QwenOpenAIProxy {
       //  statusCode: 429,
       // statusMessage: 'Too Many Requests',
       // TODO if 429 + Too Many Requests - increase wait time for account
-      liveLogger.proxyError(requestId, 500, displayAccount, error.message);
+      liveLogger.proxyError(requestId, 500, displayAccount, error.message, proxyId);
       
       if (error.message.includes('Not authenticated') || error.message.includes('access token')) {
         const authError = ErrorFormatter.openAIAuthError();
@@ -120,13 +121,13 @@ class QwenOpenAIProxy {
   
   async handleRegularChatCompletion(req, res, requestId, accountId, model, startTime) {
     const displayAccount = accountId ? accountId.substring(0, 8) : 'default';
-    
+
     try {
       const transformedMessages = systemPromptTransformer.transform(
         req.body.messages,
         req.body.model || config.defaultModel
       );
-      
+
       const response = await qwenAPI.chatCompletions({
         model: req.body.model || config.defaultModel,
         messages: transformedMessages,
@@ -140,37 +141,42 @@ class QwenOpenAIProxy {
         reasoning: req.body.reasoning,
         accountId: accountId
       });
-      
+
+      // Get actual account and proxy used after request (account may have been selected during rotation)
+      const actualAccountId = qwenAPI.getLastUsedAccountId();
+      const actualProxyId = qwenAPI.getLastUsedProxyId();
+      const actualDisplayAccount = actualAccountId ? actualAccountId.substring(0, 8) : displayAccount;
+
       const latency = Date.now() - startTime;
       const inputTokens = response?.usage?.prompt_tokens || 0;
       const outputTokens = response?.usage?.completion_tokens || 0;
       const qwenId = response?.id ? response.id.replace('chatcmpl-', '').substring(0, 8) : null;
-      
+
       if (fileLogger.isDebugLogging) {
         const logContent = fileLogger.formatLogContent(requestId, req, { model, messages: transformedMessages }, 200, latency, response);
         fileLogger.logToFile(requestId, logContent, 200);
       }
-      
-      liveLogger.proxyResponse(requestId, 200, displayAccount, latency, inputTokens, outputTokens, qwenId);
-      
+
+      liveLogger.proxyResponse(requestId, 200, actualDisplayAccount, latency, inputTokens, outputTokens, qwenId, actualProxyId);
+
       res.json(response);
     } catch (error) {
       const latency = Date.now() - startTime;
       const statusCode = error.response?.status || 500;
-      
+
       fileLogger.logError(requestId, displayAccount, statusCode, error.message);
-      
-      liveLogger.proxyError(requestId, statusCode, displayAccount, error.message);
-      
+
+      liveLogger.proxyError(requestId, statusCode, displayAccount, error.message, null);
+
       if (error.message.includes('Not authenticated') || error.message.includes('access token')) {
         const authError = ErrorFormatter.openAIAuthError();
         return res.status(authError.status).json(authError.body);
       }
-      
+
       throw error;
     }
   }
-  
+
   async handleStreamingChatCompletion(req, res, requestId, accountId, model, startTime) {
     const displayAccount = accountId ? accountId.substring(0, 8) : 'default';
     
@@ -237,24 +243,28 @@ class QwenOpenAIProxy {
       });
      
       stream.on('end', async () => {
-      	const latency = Date.now() - startTime;
-      	const qwenIdShort = qwenId ? qwenId.substring(0, 8) : null;
-      	liveLogger.proxyResponse(requestId, 200, displayAccount, latency, totalInputTokens, totalOutputTokens, qwenIdShort);
-      	
-      	// Record token usage for streaming requests
-      	if (totalInputTokens > 0 || totalOutputTokens > 0) {
-      		try {
-      			await qwenAPI.recordTokenUsage(accountId || 'default', totalInputTokens, totalOutputTokens);
-      		} catch (e) {
-      			console.error('Failed to record token usage:', e.message);
-      		}
-      	}
-      	
-      	res.end();
+        const latency = Date.now() - startTime;
+        const qwenIdShort = qwenId ? qwenId.substring(0, 8) : null;
+        // Get actual account and proxy used after request
+        const actualAccountId = qwenAPI.getLastUsedAccountId();
+        const actualProxyId = qwenAPI.getLastUsedProxyId();
+        const actualDisplayAccount = actualAccountId ? actualAccountId.substring(0, 8) : displayAccount;
+        liveLogger.proxyResponse(requestId, 200, actualDisplayAccount, latency, totalInputTokens, totalOutputTokens, qwenIdShort, actualProxyId);
+  
+        // Record token usage for streaming requests
+        if (totalInputTokens > 0 || totalOutputTokens > 0) {
+          try {
+            await qwenAPI.recordTokenUsage(actualAccountId || accountId || 'default', totalInputTokens, totalOutputTokens);
+          } catch (e) {
+            console.error('Failed to record token usage:', e.message);
+          }
+        }
+  
+        res.end();
       });
       
       stream.on('error', (error) => {
-        liveLogger.proxyError(requestId, 500, displayAccount, error.message);
+        liveLogger.proxyError(requestId, 500, displayAccount, error.message, null);
         if (!res.headersSent) {
           const apiError = ErrorFormatter.openAIApiError(error.message, 'streaming_error');
           res.status(apiError.status).json(apiError.body);
@@ -272,12 +282,12 @@ class QwenOpenAIProxy {
       
       fileLogger.logError(requestId, displayAccount, statusCode, error.message);
       
-      liveLogger.proxyError(requestId, statusCode, displayAccount, error.message);
-      
+      liveLogger.proxyError(requestId, statusCode, displayAccount, error.message, null);
+  
       if (error?.code === 'ACCOUNT_NOT_USABLE_IN_PROXY_MODE') {
         if (!res.headersSent) {
           fileLogger.logError(requestId, displayAccount, 400, error.message);
-          liveLogger.proxyError(requestId, 400, displayAccount, error.message);
+          liveLogger.proxyError(requestId, 400, displayAccount, error.message, null);
           return res.status(400).json({
             error: {
               message: error.message,
@@ -288,11 +298,11 @@ class QwenOpenAIProxy {
         }
         return;
       }
-
+  
       if (error?.code === 'NO_USABLE_PROXY_ROUTE') {
         if (!res.headersSent) {
           fileLogger.logError(requestId, displayAccount, 503, error.message);
-          liveLogger.proxyError(requestId, 503, displayAccount, error.message);
+          liveLogger.proxyError(requestId, 503, displayAccount, error.message, null);
           return res.status(503).json({
             error: {
               message: error.message,
@@ -329,12 +339,12 @@ class QwenOpenAIProxy {
       const models = await qwenAPI.listModels();
       
       const latency = Date.now() - startTime;
-      liveLogger.proxyResponse(requestId, 200, 'system', latency, 0, 0);
+      liveLogger.proxyResponse(requestId, 200, 'system', latency, 0, 0, null, null);
       
       res.json(models);
     } catch (error) {
       const latency = Date.now() - startTime;
-      liveLogger.proxyError(requestId, 500, 'system', error.message);
+      liveLogger.proxyError(requestId, 500, 'system', error.message, null);
       
       fileLogger.logError(requestId, 'system', 500, error.message);
       
@@ -364,7 +374,7 @@ class QwenOpenAIProxy {
     try {
       const deviceFlow = await authManager.initiateDeviceFlow();
       
-      liveLogger.authInitiated(deviceFlow.device_code.substring(0, 8));
+      liveLogger.authInitiated(deviceFlow.device_code.substring(0, 8), null);
       
       const response = {
         verification_uri: deviceFlow.verification_uri,
@@ -376,7 +386,7 @@ class QwenOpenAIProxy {
       res.json(response);
     } catch (error) {
       fileLogger.logError(requestId, 'auth', 500, error.message);
-      liveLogger.proxyError(requestId, 500, 'auth', error.message);
+      liveLogger.proxyError(requestId, 500, 'auth', error.message, null);
       
       res.status(500).json({
         error: {
@@ -401,13 +411,13 @@ class QwenOpenAIProxy {
           }
         };
         fileLogger.logError(requestId, 'auth', 400, 'Missing device_code or code_verifier');
-        liveLogger.proxyError(requestId, 400, 'auth', 'Missing device_code or code_verifier');
+        liveLogger.proxyError(requestId, 400, 'auth', 'Missing device_code or code_verifier', null);
         return res.status(400).json(errorResponse);
       }
       
       const token = await authManager.pollForToken(device_code, code_verifier);
       
-      liveLogger.authCompleted(device_code.substring(0, 8));
+      liveLogger.authCompleted(device_code.substring(0, 8), null);
       
       const response = {
         access_token: token,
@@ -417,13 +427,13 @@ class QwenOpenAIProxy {
       res.json(response);
     } catch (error) {
       if (error.message.includes('Validation error')) {
-        liveLogger.proxyError(requestId, 400, 'auth', error.message);
+        liveLogger.proxyError(requestId, 400, 'auth', error.message, null);
         const validationError = ErrorFormatter.openAIValidationError(error.message);
         return res.status(validationError.status).json(validationError.body);
       }
       
       fileLogger.logError(requestId, 'auth', 500, error.message);
-      liveLogger.proxyError(requestId, 500, 'auth', error.message);
+      liveLogger.proxyError(requestId, 500, 'auth', error.message, null);
       
       const apiError = ErrorFormatter.openAIApiError(error.message, 'authentication_error');
       res.status(apiError.status).json(apiError.body);
@@ -438,38 +448,43 @@ class QwenOpenAIProxy {
       const { query, page, rows } = req.body;
       
       if (!query || typeof query !== 'string') {
-        liveLogger.proxyError(requestId, 400, 'web', 'Query parameter required');
+        liveLogger.proxyError(requestId, 400, 'web', 'Query parameter required', null);
         const validationError = ErrorFormatter.openAIValidationError('Query parameter is required and must be a string');
         return res.status(validationError.status).json(validationError.body);
       }
 
       if (page && (typeof page !== 'number' || page < 1)) {
-        liveLogger.proxyError(requestId, 400, 'web', 'Page must be positive integer');
+        liveLogger.proxyError(requestId, 400, 'web', 'Page must be positive integer', null);
         const validationError = ErrorFormatter.openAIValidationError('Page must be a positive integer');
         return res.status(validationError.status).json(validationError.body);
       }
 
       if (rows && (typeof rows !== 'number' || rows < 1 || rows > 100)) {
-        liveLogger.proxyError(requestId, 400, 'web', 'Rows must be 1-100');
+        liveLogger.proxyError(requestId, 400, 'web', 'Rows must be 1-100', null);
         const validationError = ErrorFormatter.openAIValidationError('Rows must be a number between 1 and 100');
         return res.status(validationError.status).json(validationError.body);
       }
 
       const accountId = req.headers['x-qwen-account'] || req.query.account || req.body.account;
       const displayAccount = accountId ? accountId.substring(0, 8) : 'default';
-      
-      liveLogger.proxyRequest(requestId, 'web-search', displayAccount, 0);
-      
+  
+      liveLogger.proxyRequest(requestId, 'web-search', displayAccount, 0, null, false, null);
+  
       const response = await qwenAPI.webSearch({
         query: query,
         page: page || 1,
         rows: rows || 10,
         accountId: accountId
       });
-      
+  
       const latency = Date.now() - startTime;
-      
-      liveLogger.proxyResponse(requestId, 200, displayAccount, latency, 0, 0);
+  
+      // Get actual account and proxy used after request
+      const actualAccountId = qwenAPI.getLastUsedAccountId();
+      const actualProxyId = qwenAPI.getLastUsedProxyId();
+      const actualDisplayAccount = actualAccountId ? actualAccountId.substring(0, 8) : displayAccount;
+  
+      liveLogger.proxyResponse(requestId, 200, actualDisplayAccount, latency, 0, 0, null, actualProxyId);
       
       res.json(response);
     } catch (error) {
@@ -483,7 +498,7 @@ class QwenOpenAIProxy {
 
       if (error?.code === 'ACCOUNT_NOT_USABLE_IN_PROXY_MODE') {
         fileLogger.logError(requestId, 'web', 400, error.message);
-        liveLogger.proxyError(requestId, 400, 'web', error.message);
+        liveLogger.proxyError(requestId, 400, 'web', error.message, null);
         return res.status(400).json({
           error: {
             message: error.message,
@@ -495,7 +510,7 @@ class QwenOpenAIProxy {
 
       if (error?.code === 'NO_USABLE_PROXY_ROUTE') {
         fileLogger.logError(requestId, 'web', 503, error.message);
-        liveLogger.proxyError(requestId, 503, 'web', error.message);
+        liveLogger.proxyError(requestId, 503, 'web', error.message, null);
         return res.status(503).json({
           error: {
             message: error.message,
@@ -506,7 +521,7 @@ class QwenOpenAIProxy {
       }
 
       fileLogger.logError(requestId, 'web', 500, error.message);
-      liveLogger.proxyError(requestId, 500, 'web', error.message);
+      liveLogger.proxyError(requestId, 500, 'web', error.message, null);
       
       if (error.message.includes('Not authenticated') || error.message.includes('access token')) {
         const authError = ErrorFormatter.openAIAuthError();
