@@ -88,25 +88,48 @@ async function showUsageReport() {
       }
     }
     
-    // Process chat requests
-    for (const [accountId, count] of chatRequestData) {
-      // For simplicity, assume all requests are from today (since we don't have date breakdown)
-      const today = new Date().toISOString().split('T')[0];
-      allDates.add(today);
-      
-      if (!dailyUsage.has(today)) {
-        dailyUsage.set(today, {
-          chatRequests: 0,
-          inputTokens: 0,
-          outputTokens: 0,
-          webSearches: 0,
-          webResults: 0
-        });
+    // Process chat requests (with date tracking)
+    for (const [accountId, requestData] of chatRequestData) {
+      // Check if it's new format (array with dates) or old format (just a number)
+      if (Array.isArray(requestData)) {
+        // New format: array of {date, count} objects
+        for (const entry of requestData) {
+          const { date, count } = entry;
+          allDates.add(date);
+  
+          if (!dailyUsage.has(date)) {
+            dailyUsage.set(date, {
+              chatRequests: 0,
+              inputTokens: 0,
+              outputTokens: 0,
+              webSearches: 0,
+              webResults: 0
+            });
+          }
+  
+          const dailyEntry = dailyUsage.get(date);
+          dailyEntry.chatRequests += count;
+        }
+      } else if (typeof requestData === 'number') {
+        // Old format: just a number - assume today
+        const today = new Date().toISOString().split('T')[0];
+        allDates.add(today);
+  
+        if (!dailyUsage.has(today)) {
+          dailyUsage.set(today, {
+            chatRequests: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            webSearches: 0,
+            webResults: 0
+          });
+        }
+  
+        const dailyEntry = dailyUsage.get(today);
+        dailyEntry.chatRequests += requestData;
       }
-      
-      dailyUsage.get(today).chatRequests += count;
     }
-    
+  
     // Process web search requests
     for (const [accountId, count] of webSearchRequestData) {
       const today = new Date().toISOString().split('T')[0];

@@ -362,10 +362,19 @@ class QwenAPI {
         this.lastResetDate = counts.lastResetDate;
       }
       
-      // Restore request counts
+      // Restore request counts (with migration for old data format)
       if (counts.requests) {
-        for (const [accountId, count] of Object.entries(counts.requests)) {
-          this.requestCount.set(accountId, count);
+        for (const [accountId, requestData] of Object.entries(counts.requests)) {
+          // Check if it's new format (array with dates) or old format (just a number)
+          if (Array.isArray(requestData)) {
+            // New format: array of {date, count} objects
+            this.requestCount.set(accountId, requestData);
+          } else if (typeof requestData === 'number') {
+            // Old format: just a number - migrate to today's date
+            const today = new Date().toISOString().split('T')[0];
+            this.requestCount.set(accountId, [{ date: today, count: requestData }]);
+            console.log(`Migrating old request count format for ${accountId}: ${requestData} requests`);
+          }
         }
       }
       
@@ -446,11 +455,12 @@ class QwenAPI {
 
   /**
    * Reset request counts if we've crossed into a new UTC day
+   * Note: requestCount now stores data with dates, so we don't clear it
    */
   resetRequestCountsIfNeeded() {
     const today = new Date().toISOString().split('T')[0];
     if (today !== this.lastResetDate) {
-      this.requestCount.clear();
+      // Only clear web search counts (they don't have date tracking yet)
       this.webSearchRequestCounts.clear();
       this.webSearchResultCounts.clear();
       this.lastResetDate = today;
@@ -492,14 +502,34 @@ class QwenAPI {
   }
 
   /**
-   * Increment request count for an account
+   * Increment request count for an account (with date tracking)
    * @param {string} accountId - The account ID
    */
   async incrementRequestCount(accountId) {
     this.resetRequestCountsIfNeeded();
-    const currentCount = this.requestCount.get(accountId) || 0;
-    this.requestCount.set(accountId, currentCount + 1);
-    
+    const currentDate = new Date().toISOString().split('T')[0];
+
+    // Initialize request count array for this account if it doesn't exist
+    if (!this.requestCount.has(accountId)) {
+      this.requestCount.set(accountId, []);
+    }
+
+    const accountRequests = this.requestCount.get(accountId);
+
+    // Find existing entry for today
+    let todayEntry = accountRequests.find(entry => entry.date === currentDate);
+
+    if (todayEntry) {
+      // Update existing entry
+      todayEntry.count += 1;
+    } else {
+      // Create new entry for today
+      accountRequests.push({
+        date: currentDate,
+        count: 1
+      });
+    }
+
     // Schedule save instead of saving immediately
     this.scheduleSave();
   }
@@ -546,13 +576,22 @@ class QwenAPI {
   }
 
   /**
-   * Get request count for an account
+   * Get request count for an account (today's count)
    * @param {string} accountId - The account ID
-   * @returns {number} The request count
+   * @returns {number} The request count for today
    */
   getRequestCount(accountId) {
     this.resetRequestCountsIfNeeded();
-    return this.requestCount.get(accountId) || 0;
+    const currentDate = new Date().toISOString().split('T')[0];
+    const accountRequests = this.requestCount.get(accountId);
+
+    if (!accountRequests) {
+      return 0;
+    }
+
+    // Find today's entry
+    const todayEntry = accountRequests.find(entry => entry.date === currentDate);
+    return todayEntry ? todayEntry.count : 0;
   }
 
   normalizeAccountId(accountId) {
