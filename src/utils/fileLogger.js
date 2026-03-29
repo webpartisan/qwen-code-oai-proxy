@@ -18,6 +18,7 @@ const LOG_DIR = path.join(process.cwd(), 'log');
 if ((isErrorLogging || isDebugLogging) && !fs.existsSync(LOG_DIR)) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
 }
+let cleanupJobStarted = false;
 
 function maskSensitiveHeaders(headers) {
   if (!headers) return {};
@@ -93,6 +94,18 @@ function logToFile(requestId, content, statusCode) {
       const filepath = path.join(requestDir, filename);
       fsPromises.writeFile(filepath, data).catch(() => {});
     }
+  }).catch(() => {});
+}
+
+function logDebugJson(requestId, data, type) {
+  if (!isErrorDebugLogging) return;
+  
+  const requestDir = path.join(LOG_DIR, `req-${requestId}`);
+  fsPromises.mkdir(requestDir, { recursive: true }).then(() => {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `${type}-${timestamp}.json`;
+    const filepath = path.join(requestDir, filename);
+    fsPromises.writeFile(filepath, JSON.stringify(data, null, 2)).catch(() => {});
   }).catch(() => {});
 }
 
@@ -236,7 +249,9 @@ async function cleanupLogs() {
 }
 
 function startCleanupJob() {
+  if (cleanupJobStarted) return;
   if (logLevel === 'off') return;
+  cleanupJobStarted = true;
 
   const debugModeDesc = isDebugLogging ? 'full' : (isErrorDebugLogging ? 'non-200 only' : 'off');
   console.log(`[LOG] Logging mode=${logLevel}, debug=${debugModeDesc} - error.log: ${ERROR_LOG_MAX_MB}MB, error logs: ${ERROR_LOG_MAX_DAYS} days, request logs: last ${MAX_DEBUG_LOGS} files`);
@@ -251,6 +266,7 @@ function startCleanupJob() {
 module.exports = {
   logToFile,
   logErrorFile,
+  logDebugJson,
   formatLogContent,
   logError,
   isErrorLogging,
