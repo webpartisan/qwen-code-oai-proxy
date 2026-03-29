@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node --env-file=.env src/index.js",
     "dev": "node src/index.js",
-    "test": "node test-proxy.js",
+    "test": "jest",
     "test:simple": "node test-simple.js",
     "test:all": "node test-all-accounts.js",
     "auth": "node authenticate.js",
@@ -41,6 +41,23 @@
     "winston": "^3.19.0"
   },
   "devDependencies": {
+    "jest": "^29.7.0",
     "nodemon": "^3.0.1"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/__tests__/**/*.test.js",
+      "**/*.test.js"
+    ],
+    "collectCoverageFrom": [
+      "src/**/*.js",
+      "!src/index.js"
+    ],
+    "coverageDirectory": "coverage",
+    "coveragePathIgnorePatterns": [
+      "/node_modules/",
+      "/test/"
+    ]
   }
 }
