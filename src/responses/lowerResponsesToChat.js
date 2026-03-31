@@ -2,67 +2,30 @@ const { systemPromptTransformer } = require('../utils/systemPromptTransformer.js
 const config = require('../config.js');
 
 /**
- * Detect Codex-like requests based on observed request shape signals.
- * 
- * Signals used (in priority order):
- * 1. Presence of agent-style tools (shell, local_shell, function tools with shell-like names)
- * 2. Presence of function_call or function_call_output items
- * 3. Presence of developer-role messages
- * 4. Presence of instructions field (common in Codex)
- * 5. Explicit Codex markers in instructions (weak signal)
- * 
+ * Detect agent-mode requests that already carry orchestration instructions
+ * from the client, so we should not inject the standalone Qwen system prompt.
+ *
+ * Current rule:
+ * - If the request exposes the spawn_agent tool, treat it as the main Codex chat.
+ * - Otherwise treat it as sub-agent mode.
+ *
  * @param {object} normalizedRequest - The normalized responses request
- * @returns {boolean} - True if this appears to be a Codex-like request
+ * @returns {boolean} - True if this request is in agent mode
  */
-function isCodexLikeRequest(normalizedRequest) {
+function isAgentModeRequest(normalizedRequest) {
   if (!normalizedRequest) return false;
-  
-  // Signal 1: Check for agent-style tools
-  if (normalizedRequest.tools && Array.isArray(normalizedRequest.tools)) {
-    const agentToolTypes = ['shell', 'local_shell', 'custom'];
-    const hasAgentTool = normalizedRequest.tools.some(t => 
-      agentToolTypes.includes(t.type) ||
-      (t.type === 'function' && t.name && ['shell', 'bash', 'execute'].includes(t.name.toLowerCase()))
-    );
-    if (hasAgentTool) return true;
-  }
-  
-  // Signal 2: Check for function_call / function_call_output items
-  if (normalizedRequest.inputItems && Array.isArray(normalizedRequest.inputItems)) {
-    const hasFunctionLoop = normalizedRequest.inputItems.some(item =>
-      item.type === 'function_call' || item.type === 'function_call_output'
-    );
-    if (hasFunctionLoop) return true;
-  }
-  
-  // Signal 3: Check for developer-role messages
-  if (normalizedRequest.inputItems && Array.isArray(normalizedRequest.inputItems)) {
-    const hasDeveloperMessage = normalizedRequest.inputItems.some(item =>
-      item.type === 'message' && item.role === 'developer'
-    );
-    if (hasDeveloperMessage) return true;
-  }
-  
-  // Signal 4: Presence of instructions field (common but not definitive)
-  // Combined with other weak signals
-  if (normalizedRequest.instructions) {
-    // Signal 5: Weak Codex markers in instructions
-    const codexMarkers = [
-      'Codex CLI',
-      'coding agent',
-      'terminal-based coding assistant',
-      'sandbox',
-      'escalation',
-      'prefix_rule',
-      'writable_roots'
-    ];
-    const hasCodexMarker = codexMarkers.some(marker => 
-      normalizedRequest.instructions.includes(marker)
-    );
-    if (hasCodexMarker) return true;
-  }
-  
-  return false;
+
+  const tools = Array.isArray(normalizedRequest.tools) ? normalizedRequest.tools : [];
+  const hasSpawnAgentTool = tools.some((tool) => {
+    if (!tool || typeof tool !== 'object') {
+      return false;
+    }
+
+    const toolName = tool.name || tool.function?.name || null;
+    return toolName === 'spawn_agent';
+  });
+
+  return !hasSpawnAgentTool;
 }
 
 // Map common model aliases to actual Qwen models
@@ -111,8 +74,7 @@ function lowerToolsForChat(tools) {
 function lowerResponsesToChat({ normalizedRequest, previousRecord }) {
   const model = resolveModel(normalizedRequest.model);
   
-  // Detect Codex-like requests to apply appropriate prompt policy
-  const isCodexLike = isCodexLikeRequest(normalizedRequest);
+  const isAgentMode = isAgentModeRequest(normalizedRequest);
   
   const instructionMessages = buildInstructionMessages(normalizedRequest.instructions);
   const carryoverMessages = buildCarryoverMessages(previousRecord);
@@ -124,9 +86,9 @@ function lowerResponsesToChat({ normalizedRequest, previousRecord }) {
     ...currentInputMessages
   ];
 
-  // Apply system prompt transformer ONLY for non-Codex requests
-  // Codex sends its own comprehensive instructions via 'instructions' and developer messages
-  if (!isCodexLike) {
+  // Sub-agents already receive Codex orchestration instructions, so we avoid
+  // injecting the standalone Qwen system prompt on top of them.
+  if (!isAgentMode) {
     allMessages = systemPromptTransformer.transform(
       allMessages,
       model
@@ -286,7 +248,7 @@ function normalizeItemContent(content) {
 
 module.exports = {
   lowerResponsesToChat,
-  isCodexLikeRequest,
+  isAgentModeRequest,
   buildInstructionMessages,
   buildCarryoverMessages,
   buildCurrentInputMessages,

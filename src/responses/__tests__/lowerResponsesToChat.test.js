@@ -1,4 +1,4 @@
-const { lowerResponsesToChat, isCodexLikeRequest, lowerToolsForChat } = require('../lowerResponsesToChat');
+const { lowerResponsesToChat, isAgentModeRequest, lowerToolsForChat } = require('../lowerResponsesToChat');
 
 // Helper to extract content as string (handles array format from systemPromptTransformer)
 function getContentAsString(msg) {
@@ -12,41 +12,65 @@ function getContentAsString(msg) {
 }
 
 describe('lowerResponsesToChat', () => {
-  describe('isCodexLikeRequest detection', () => {
-    it('should detect Codex-like request by agent tools', () => {
+  describe('isAgentModeRequest detection', () => {
+    it('should detect agent mode when spawn_agent tool is absent', () => {
       const request = {
-        tools: [{ type: 'shell' }]
-      };
-      expect(isCodexLikeRequest(request)).toBe(true);
-    });
-
-    it('should detect Codex-like request by function_call items', () => {
-      const request = {
+        tools: [
+          { type: 'function', name: 'shell', parameters: {} }
+        ],
         inputItems: [{ type: 'function_call', name: 'test' }]
       };
-      expect(isCodexLikeRequest(request)).toBe(true);
+      expect(isAgentModeRequest(request)).toBe(true);
     });
 
-    it('should detect Codex-like request by developer message', () => {
+    it('should detect agent mode when tools are missing entirely', () => {
+      const request = {
+        inputItems: [{ type: 'function_call_output', call_id: 'call_1', output: 'ok' }]
+      };
+      expect(isAgentModeRequest(request)).toBe(true);
+    });
+
+    it('should detect agent mode for developer messages when spawn_agent is absent', () => {
       const request = {
         inputItems: [{ type: 'message', role: 'developer', content: [] }]
       };
-      expect(isCodexLikeRequest(request)).toBe(true);
+      expect(isAgentModeRequest(request)).toBe(true);
     });
 
-    it('should detect Codex-like request by Codex markers', () => {
+    it('should not detect agent mode by tools alone', () => {
       const request = {
+        tools: [
+          { type: 'shell', name: 'shell' },
+          { type: 'function', name: 'spawn_agent', parameters: {} }
+        ]
+      };
+      expect(isAgentModeRequest(request)).toBe(false);
+    });
+
+    it('should not detect agent mode when spawn_agent tool is present', () => {
+      const request = {
+        tools: [
+          { type: 'function', name: 'spawn_agent', parameters: {} },
+          { type: 'function', name: 'shell', parameters: {} }
+        ],
+        inputItems: [
+          { type: 'message', role: 'developer', content: [] },
+          { type: 'function_call', name: 'shell' },
+          { type: 'function_call_output', call_id: 'call_1', output: 'ok' }
+        ]
+      };
+      expect(isAgentModeRequest(request)).toBe(false);
+    });
+
+    it('should not detect regular request as agent mode from instructions alone', () => {
+      const request = {
+        tools: [
+          { type: 'function', name: 'spawn_agent', parameters: {} }
+        ],
+        inputItems: [{ type: 'message', role: 'user', content: [] }],
         instructions: 'You are a coding agent for Codex CLI'
       };
-      expect(isCodexLikeRequest(request)).toBe(true);
-    });
-
-    it('should not detect regular request as Codex-like', () => {
-      const request = {
-        inputItems: [{ type: 'message', role: 'user', content: [] }],
-        instructions: 'Be helpful'
-      };
-      expect(isCodexLikeRequest(request)).toBe(false);
+      expect(isAgentModeRequest(request)).toBe(false);
     });
   });
 
