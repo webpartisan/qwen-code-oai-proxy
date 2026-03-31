@@ -77,26 +77,28 @@ function maskAccountId(accountId) {
 }
 
 const liveLogger = {
-  proxyRequest(requestId, model, accountId, tokenCount, requestNum, isStreaming, proxyId) {
+  proxyRequest(requestId, model, accountId, tokenCount, requestNum, isStreaming, proxyId, endpoint = 'chat') {
     const reqNumStr = requestNum ? colors.gray(`#${requestNum}`) : '';
     const streamStr = isStreaming ? colors.cyan('{streaming}') : '';
+    const endpointStr = endpoint === 'responses' ? colors.magenta('[responses] ') : '';
     // Show "inbound" for requests since account/proxy not yet determined
     // Only show account if it's a real account (not 'default' or null)
     const hasRealAccount = accountId && accountId !== 'default';
     const accountInfo = hasRealAccount ? formatAccountTag(accountId) : colors.gray('[inbound]');
     const proxyInfo = proxyId ? formatProxyTag(proxyId) : '';
-    const msg = `${colors.blue('→')} ${accountInfo}${proxyInfo} ${colors.gray(requestId.substring(0, 8))} | ${colors.yellow(model)} ${streamStr} | ${colors.gray(`${tokenCount} tokens`)} ${reqNumStr}`;
+    const msg = `${colors.blue('→')} ${accountInfo}${proxyInfo} ${endpointStr}${colors.gray(requestId.substring(0, 8))} | ${colors.yellow(model)} ${streamStr} | ${colors.gray(`${tokenCount} tokens`)} ${reqNumStr}`;
     log(msg);
   },
 
-  proxyResponse(requestId, statusCode, accountId, latency, inputTokens, outputTokens, qwenId, proxyId) {
+  proxyResponse(requestId, statusCode, accountId, latency, inputTokens, outputTokens, qwenId, proxyId, isStreaming = false) {
     const statusColor = statusCode === 200 ? colors.green : colors.red;
+    const streamMarker = isStreaming ? `${colors.cyan('[stream]')} ` : '';
     const tokenInfo = inputTokens && outputTokens
-      ? ` | ${colors.cyan(`${inputTokens}+${outputTokens} tok`)}`
+      ? ` | ${colors.cyan(`${inputTokens}+${outputTokens}tok`)}`
       : '';
     const shortId = requestId.length > 12 ? requestId.substring(0, 8) : requestId;
     const qwenInfo = qwenId ? ` | ${colors.magenta(`qwen: ${qwenId}`)}` : '';
-    const msg = `${colors.blue('←')} ${formatAccountAndProxy(accountId, proxyId)} ${colors.gray(shortId)} ${statusColor(statusCode)} | ${colors.gray(`${latency}ms`)}${tokenInfo}${qwenInfo}`;
+    const msg = `${colors.blue('←')} ${formatAccountAndProxy(accountId, proxyId)} ${streamMarker}${colors.gray(shortId)} ${statusColor(statusCode)} | ${colors.gray(`${latency}ms`)}${tokenInfo}${qwenInfo}`;
     log(msg);
   },
 

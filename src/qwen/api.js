@@ -1183,6 +1183,30 @@ class QwenAPI {
     return this._lastUsedProxyId;
   }
 
+  /**
+  * Get the last used input tokens from the most recent streaming request
+  * @returns {number|null} The input tokens or null
+  */
+  getLastUsedInputTokens() {
+    return this._lastUsedInputTokens;
+  }
+
+  /**
+  * Get the last used output tokens from the most recent streaming request
+  * @returns {number|null} The output tokens or null
+  */
+  getLastUsedOutputTokens() {
+    return this._lastUsedOutputTokens;
+  }
+
+  /**
+  * Clear the last used tokens (call after logging)
+  */
+  clearLastUsedTokens() {
+    this._lastUsedInputTokens = null;
+    this._lastUsedOutputTokens = null;
+  }
+
   async processRequestWithAccount(request, accountInfo) {
     const { credentials } = accountInfo;
     
@@ -1384,9 +1408,92 @@ class QwenAPI {
       configuredAccounts,
       async (accountInfo) => {
         await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
-        return this.processStreamingRequestWithAccount(request, accountInfo);
+        
+        // Set last used account/proxy immediately for logging purposes
+        this._lastUsedAccountId = accountInfo.accountId;
+        this._lastUsedProxyId = this.proxyManager.getProxyForAccount(accountInfo.accountId);
+        
+        const originalStream = await this.processStreamingRequestWithAccount(request, accountInfo);
+        
+        // Wrap the stream to capture token usage from the final chunk
+        const { PassThrough } = require('stream');
+        const wrappedStream = new PassThrough();
+        let buffer = '';
+        let usageRecorded = false;
+
+        originalStream.on('data', (chunk) => {
+          const chunkStr = chunk.toString();
+          buffer += chunkStr;
+
+          // Check if this chunk contains usage data
+          const lines = chunkStr.split('\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              if (data === '[DONE]') continue;
+              try {
+                const json = JSON.parse(data);
+                if (json.usage && !usageRecorded) {
+                  const inputTokens = json.usage.prompt_tokens || 0;
+                  const outputTokens = json.usage.completion_tokens || 0;
+                  if (inputTokens > 0 || outputTokens > 0) {
+                    // Store tokens for logging in proxy.js
+                    this._lastUsedInputTokens = inputTokens;
+                    this._lastUsedOutputTokens = outputTokens;
+                    this.recordTokenUsage(accountInfo.accountId, inputTokens, outputTokens).catch(err => {
+                      console.error(`\x1b[31m[STREAM] Failed to record token usage: ${err.message}\x1b[0m`);
+                    });
+                    usageRecorded = true;
+                  }
+                }
+              } catch (e) {
+                // Ignore parse errors for non-JSON lines
+              }
+            }
+          }
+
+          wrappedStream.write(chunk);
+        });
+
+        originalStream.on('end', () => {
+          // Also check buffer in case usage data was split across chunks
+          if (!usageRecorded && buffer) {
+            const lines = buffer.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const data = line.slice(6);
+                if (data === '[DONE]') continue;
+                try {
+                  const json = JSON.parse(data);
+                  if (json.usage) {
+                    const inputTokens = json.usage.prompt_tokens || 0;
+                    const outputTokens = json.usage.completion_tokens || 0;
+                    if (inputTokens > 0 || outputTokens > 0) {
+                      // Store tokens for logging in proxy.js
+                      this._lastUsedInputTokens = inputTokens;
+                      this._lastUsedOutputTokens = outputTokens;
+                      this.recordTokenUsage(accountInfo.accountId, inputTokens, outputTokens).catch(err => {
+                        console.error(`\x1b[31m[STREAM] Failed to record token usage: ${err.message}\x1b[0m`);
+                      });
+                      usageRecorded = true;
+                    }
+                  }
+                } catch (e) {
+                  // Ignore parse errors
+                }
+              }
+            }
+          }
+          wrappedStream.end();
+        });
+
+        originalStream.on('error', (error) => {
+          wrappedStream.emit('error', error);
+        });
+
+        return wrappedStream;
       },
-      async (accountId) => {
+      async (accountId, stream) => {
         // Store the account and proxy used for this request
         this._lastUsedAccountId = accountId;
         this._lastUsedProxyId = this.proxyManager.getProxyForAccount(accountId);
