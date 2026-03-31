@@ -76,19 +76,25 @@ describe('QwenOpenAIProxy /v1/responses', () => {
   });
 
   it('persists full non-stream carryover including previous context, current input, and assistant output', async () => {
-    const { QwenOpenAIProxy } = require('../proxy.js');
-    const qwenAPI = {
-      chatCompletions: jest.fn().mockResolvedValue({
-        model: 'qwen3-coder-plus',
-        choices: [
-          {
-            message: { content: 'New assistant answer' },
-            finish_reason: 'stop'
-          }
-        ],
-        usage: {}
-      })
-    };
+  	const { QwenOpenAIProxy } = require('../proxy.js');
+  	const qwenAPI = {
+  		chatCompletions: jest.fn().mockResolvedValue({
+  			response: {
+  				model: 'qwen3-coder-plus',
+  				choices: [
+  					{
+  						message: { content: 'New assistant answer' },
+  						finish_reason: 'stop'
+  					}
+  				],
+  				usage: {}
+  			},
+  			metadata: {
+  				accountId: 'test-account',
+  				proxyId: 'test-proxy'
+  			}
+  		})
+  	};
     const proxy = new QwenOpenAIProxy({
       qwenAPI,
       authManager: {},
@@ -145,8 +151,13 @@ describe('QwenOpenAIProxy /v1/responses', () => {
     }));
 
     const { QwenOpenAIProxy } = require('../proxy.js');
+    const mockStream = new PassThrough();
+    mockStream.metadata = { accountId: 'test-account', proxyId: 'test-proxy', inputTokens: 0, outputTokens: 0 };
     const qwenAPI = {
-      streamChatCompletions: jest.fn().mockResolvedValue(new PassThrough())
+    	streamChatCompletions: jest.fn().mockResolvedValue({
+    		response: mockStream,
+    		metadata: { accountId: 'test-account', proxyId: 'test-proxy' }
+    	})
     };
     const proxy = new QwenOpenAIProxy({
       qwenAPI,

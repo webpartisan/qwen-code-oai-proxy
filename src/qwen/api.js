@@ -270,22 +270,27 @@ function isAuthError(error) {
  * Check if an error is related to quota limits
  */
 function isQuotaExceededError(error) {
-  if (!error) return false;
+	if (!error) return false;
 
-  const errorMessage =
-    error instanceof Error
-      ? error.message.toLowerCase()
-      : String(error).toLowerCase();
+	const errorMessage =
+		error instanceof Error
+			? error.message.toLowerCase()
+			: String(error).toLowerCase();
 
-  // Define a type for errors that might have status or code properties
-  const errorWithCode = error;
-  const errorCode = errorWithCode?.response?.status || errorWithCode?.code;
+	// Check error response data for quota-related codes
+	const errorData = error?.response?.data || error?.responseData;
+	const errorCode = errorData?.error?.code || errorData?.code || '';
+	const errorType = errorData?.error?.type || errorData?.type || '';
+	const dataMessage = errorData?.error?.message || errorData?.message || '';
 
-  return (
-    errorMessage.includes('insufficient_quota') ||
-    errorMessage.includes('free allocated quota exceeded') ||
-    (errorMessage.includes('quota') && errorMessage.includes('exceeded'))
-  );
+	// Check all possible locations for quota exceeded indicators
+	const allContent = `${errorMessage} ${errorCode} ${errorType} ${dataMessage}`.toLowerCase();
+
+	return (
+		allContent.includes('insufficient_quota') ||
+		allContent.includes('free allocated quota exceeded') ||
+		(allContent.includes('quota') && allContent.includes('exceeded'))
+	);
 }
 
 /**
@@ -896,31 +901,45 @@ class QwenAPI {
       	const errorCode = errorData?.error?.code || errorData?.code;
       	const errorType = errorData?.error?.type || errorData?.type;
       	const requestId = errorData?.request_id;
-     
+    
+      	// Check if this is actually a quota exceeded error (should add strike, not retry)
+      	// Use the already-extracted errorData which has the correct structure
+      	if (errorCode === 'insufficient_quota' || errorType === 'insufficient_quota' ||
+      		errorMessage.toLowerCase().includes('insufficient_quota') ||
+      		errorMessage.toLowerCase().includes('quota') && errorMessage.toLowerCase().includes('exceeded')) {
+      		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Quota exceeded detected in 429 response: code="${errorCode}", message="${errorMessage}"\x1b[0m`);
+      		throw {
+      			error,
+      			countStrike: false,
+      			locked: false,
+      			isQuotaExceeded: true
+      		};
+      	}
+    
       	// Get current rate limit counts for debugging
       	const accountCount = this.healthManager.getRateLimitCount(accountInfo.accountId);
       	const proxyId = this.proxyManager.getProxyForAccount(accountInfo.accountId);
       	const ipCount = proxyId ? this.proxyManager.getIpRateLimitCount(proxyId) : 0;
-     
+    
       	console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Rate limit hit: ${statusCode} (account: ${accountCount}/${this.healthManager.rateLimitMax}, ip: ${ipCount}/${this.proxyManager.rateLimitMax})\x1b[0m`);
-      	
+    
       	// Log detailed error info from server response in one line
       	if (errorCode) {
       		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Server error: code="${errorCode}"${errorType ? `, type="${errorType}"` : ''}, message="${errorMessage}"${requestId ? `, request_id="${requestId}"` : ''}\x1b[0m`);
       	} else {
       		console.log(`\x1b[33m[ACCOUNT ${accountInfo.accountId}] Error message: "${errorMessage}"${requestId ? `, request_id="${requestId}"` : ''}\x1b[0m`);
       	}
-        
-        // Check if we've exhausted rate limit retries
-        if (rateLimitRetryCount >= config.rateLimitMaxRetries) {
-        	console.log(`\x1b[31m[ACCOUNT ${accountInfo.accountId}] Rate limit retries exhausted after ${rateLimitRetryCount} attempts, switching to next account\x1b[0m`);
-        	throw {
-        		error,
-        		countStrike: false,
-        		locked: false,
-        		isRateLimit: true
-        	};
-        }
+    
+      	// Check if we've exhausted rate limit retries
+      	if (rateLimitRetryCount >= config.rateLimitMaxRetries) {
+      		console.log(`\x1b[31m[ACCOUNT ${accountInfo.accountId}] Rate limit retries exhausted after ${rateLimitRetryCount} attempts, switching to next account\x1b[0m`);
+      		throw {
+      			error,
+      			countStrike: false,
+      			locked: false,
+      			isRateLimit: true
+      		};
+      	}
         
         // Calculate exponential backoff delay: 2s, 4s, 8s, 16s, 32s
         const baseDelay = config.rateLimitRetryDelayMs;
@@ -1023,7 +1042,14 @@ class QwenAPI {
           await onSuccess(candidate.accountId, result);
           this.healthManager.resetStrikes(candidate.accountId);
           console.log(`\x1b[32m[ACCOUNT ${candidate.accountId}] Request successful (proxy: ${proxyInfo})\x1b[0m`);
-          return result;
+          // Return wrapped response with metadata (request-scoped, no race condition)
+          return {
+          	response: result,
+          	metadata: {
+          		accountId: candidate.accountId,
+          		proxyId: proxyId
+          	}
+          };
         } catch (outcome) {
           if (outcome.locked) {
             attemptsUsed -= 1;
@@ -1134,79 +1160,32 @@ class QwenAPI {
   }
 
   async chatCompletions(request) {
-    await this.refreshAccountProxyBindings();
-    const configuredAccounts = this.buildAccountList(request);
-
-    // Reset last used account info
-    this._lastUsedAccountId = null;
-    this._lastUsedProxyId = null;
-
-    return await this.executeWithAccountRotation(
-      configuredAccounts,
-      async (accountInfo) => {
-        await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
-        return this.processRequestWithAccount(request, accountInfo);
-      },
-      async (accountId, response) => {
-        // Store the account and proxy used for this request
-        this._lastUsedAccountId = accountId;
-        this._lastUsedProxyId = this.proxyManager.getProxyForAccount(accountId);
-
-        await this.incrementRequestCount(accountId);
-        this.healthManager.incrementAccountRateLimit(accountId);
-        this.handleSuccessfulProxyUsage(accountId);
-
-        if (response && response.usage) {
-          await this.recordTokenUsage(
-            accountId,
-            response.usage.prompt_tokens || 0,
-            response.usage.completion_tokens || 0
-          );
-        }
-      }
-    );
+  	await this.refreshAccountProxyBindings();
+  	const configuredAccounts = this.buildAccountList(request);
+ 
+  	// Return {response, metadata} - request-scoped, no race condition
+  	return await this.executeWithAccountRotation(
+  		configuredAccounts,
+  		async (accountInfo) => {
+  			await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
+  			return this.processRequestWithAccount(request, accountInfo);
+  		},
+  		async (accountId, response) => {
+  			await this.incrementRequestCount(accountId);
+  			this.healthManager.incrementAccountRateLimit(accountId);
+  			this.handleSuccessfulProxyUsage(accountId);
+ 
+  			if (response && response.usage) {
+  				await this.recordTokenUsage(
+  					accountId,
+  					response.usage.prompt_tokens || 0,
+  					response.usage.completion_tokens || 0
+  				);
+  			}
+  		}
+  	);
   }
-
-  /**
-   * Get the last used account ID from the most recent request
-   * @returns {string|null} The account ID or null
-   */
-  getLastUsedAccountId() {
-    return this._lastUsedAccountId;
-  }
-
-  /**
-   * Get the last used proxy ID from the most recent request
-   * @returns {string|null} The proxy ID or null
-   */
-  getLastUsedProxyId() {
-    return this._lastUsedProxyId;
-  }
-
-  /**
-  * Get the last used input tokens from the most recent streaming request
-  * @returns {number|null} The input tokens or null
-  */
-  getLastUsedInputTokens() {
-    return this._lastUsedInputTokens;
-  }
-
-  /**
-  * Get the last used output tokens from the most recent streaming request
-  * @returns {number|null} The output tokens or null
-  */
-  getLastUsedOutputTokens() {
-    return this._lastUsedOutputTokens;
-  }
-
-  /**
-  * Clear the last used tokens (call after logging)
-  */
-  clearLastUsedTokens() {
-    this._lastUsedInputTokens = null;
-    this._lastUsedOutputTokens = null;
-  }
-
+ 
   async processRequestWithAccount(request, accountInfo) {
     const { credentials } = accountInfo;
     
@@ -1397,112 +1376,109 @@ class QwenAPI {
    * @returns {Promise<Stream>} - A stream of SSE events
    */
   async streamChatCompletions(request) {
-    await this.refreshAccountProxyBindings();
-    const configuredAccounts = this.buildAccountList(request);
-
-    // Reset last used account info
-    this._lastUsedAccountId = null;
-    this._lastUsedProxyId = null;
-
-    return await this.executeWithAccountRotation(
-      configuredAccounts,
-      async (accountInfo) => {
-        await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
-        
-        // Set last used account/proxy immediately for logging purposes
-        this._lastUsedAccountId = accountInfo.accountId;
-        this._lastUsedProxyId = this.proxyManager.getProxyForAccount(accountInfo.accountId);
-        
-        const originalStream = await this.processStreamingRequestWithAccount(request, accountInfo);
-        
-        // Wrap the stream to capture token usage from the final chunk
-        const { PassThrough } = require('stream');
-        const wrappedStream = new PassThrough();
-        let buffer = '';
-        let usageRecorded = false;
-
-        originalStream.on('data', (chunk) => {
-          const chunkStr = chunk.toString();
-          buffer += chunkStr;
-
-          // Check if this chunk contains usage data
-          const lines = chunkStr.split('\n');
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6);
-              if (data === '[DONE]') continue;
-              try {
-                const json = JSON.parse(data);
-                if (json.usage && !usageRecorded) {
-                  const inputTokens = json.usage.prompt_tokens || 0;
-                  const outputTokens = json.usage.completion_tokens || 0;
-                  if (inputTokens > 0 || outputTokens > 0) {
-                    // Store tokens for logging in proxy.js
-                    this._lastUsedInputTokens = inputTokens;
-                    this._lastUsedOutputTokens = outputTokens;
-                    this.recordTokenUsage(accountInfo.accountId, inputTokens, outputTokens).catch(err => {
-                      console.error(`\x1b[31m[STREAM] Failed to record token usage: ${err.message}\x1b[0m`);
-                    });
-                    usageRecorded = true;
-                  }
-                }
-              } catch (e) {
-                // Ignore parse errors for non-JSON lines
-              }
-            }
-          }
-
-          wrappedStream.write(chunk);
-        });
-
-        originalStream.on('end', () => {
-          // Also check buffer in case usage data was split across chunks
-          if (!usageRecorded && buffer) {
-            const lines = buffer.split('\n');
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                const data = line.slice(6);
-                if (data === '[DONE]') continue;
-                try {
-                  const json = JSON.parse(data);
-                  if (json.usage) {
-                    const inputTokens = json.usage.prompt_tokens || 0;
-                    const outputTokens = json.usage.completion_tokens || 0;
-                    if (inputTokens > 0 || outputTokens > 0) {
-                      // Store tokens for logging in proxy.js
-                      this._lastUsedInputTokens = inputTokens;
-                      this._lastUsedOutputTokens = outputTokens;
-                      this.recordTokenUsage(accountInfo.accountId, inputTokens, outputTokens).catch(err => {
-                        console.error(`\x1b[31m[STREAM] Failed to record token usage: ${err.message}\x1b[0m`);
-                      });
-                      usageRecorded = true;
-                    }
-                  }
-                } catch (e) {
-                  // Ignore parse errors
-                }
-              }
-            }
-          }
-          wrappedStream.end();
-        });
-
-        originalStream.on('error', (error) => {
-          wrappedStream.emit('error', error);
-        });
-
-        return wrappedStream;
-      },
-      async (accountId, stream) => {
-        // Store the account and proxy used for this request
-        this._lastUsedAccountId = accountId;
-        this._lastUsedProxyId = this.proxyManager.getProxyForAccount(accountId);
-
-        await this.incrementRequestCount(accountId);
-        this.healthManager.incrementAccountRateLimit(accountId);
-        this.handleSuccessfulProxyUsage(accountId);
-      }
-    );
+  	await this.refreshAccountProxyBindings();
+  	const configuredAccounts = this.buildAccountList(request);
+ 
+  	// Return {response, metadata} - request-scoped, no race condition
+  	return await this.executeWithAccountRotation(
+  		configuredAccounts,
+  		async (accountInfo) => {
+  			await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
+ 
+  			const originalStream = await this.processStreamingRequestWithAccount(request, accountInfo);
+ 
+  			// Wrap the stream to capture token usage from the final chunk
+  			const { PassThrough } = require('stream');
+  			const wrappedStream = new PassThrough();
+  			let buffer = '';
+  			let usageRecorded = false;
+ 
+  			// Attach metadata to stream (request-scoped, no race condition)
+  			wrappedStream.metadata = {
+  				accountId: accountInfo.accountId,
+  				proxyId: this.proxyManager.getProxyForAccount(accountInfo.accountId),
+  				inputTokens: 0,
+  				outputTokens: 0
+  			};
+ 
+  			originalStream.on('data', (chunk) => {
+  				const chunkStr = chunk.toString();
+  				buffer += chunkStr;
+ 
+  				// Check if this chunk contains usage data
+  				const lines = chunkStr.split('\n');
+  				for (const line of lines) {
+  					if (line.startsWith('data: ')) {
+  						const data = line.slice(6);
+  						if (data === '[DONE]') continue;
+  						try {
+  							const json = JSON.parse(data);
+  							if (json.usage && !usageRecorded) {
+  								const inputTokens = json.usage.prompt_tokens || 0;
+  								const outputTokens = json.usage.completion_tokens || 0;
+  								if (inputTokens > 0 || outputTokens > 0) {
+  									// Store tokens in stream metadata (request-scoped)
+  									wrappedStream.metadata.inputTokens = inputTokens;
+  									wrappedStream.metadata.outputTokens = outputTokens;
+  									this.recordTokenUsage(accountInfo.accountId, inputTokens, outputTokens).catch(err => {
+  										console.error(`\x1b[31m[STREAM] Failed to record token usage: ${err.message}\x1b[0m`);
+  									});
+  									usageRecorded = true;
+  								}
+  							}
+  						} catch (e) {
+  							// Ignore parse errors for non-JSON lines
+  						}
+  					}
+  				}
+ 
+  				wrappedStream.write(chunk);
+  			});
+ 
+  			originalStream.on('end', () => {
+  				// Also check buffer in case usage data was split across chunks
+  				if (!usageRecorded && buffer) {
+  					const lines = buffer.split('\n');
+  					for (const line of lines) {
+  						if (line.startsWith('data: ')) {
+  							const data = line.slice(6);
+  							if (data === '[DONE]') continue;
+  							try {
+  								const json = JSON.parse(data);
+  								if (json.usage) {
+  									const inputTokens = json.usage.prompt_tokens || 0;
+  									const outputTokens = json.usage.completion_tokens || 0;
+  									if (inputTokens > 0 || outputTokens > 0) {
+  										// Store tokens in stream metadata (request-scoped)
+  										wrappedStream.metadata.inputTokens = inputTokens;
+  										wrappedStream.metadata.outputTokens = outputTokens;
+  										this.recordTokenUsage(accountInfo.accountId, inputTokens, outputTokens).catch(err => {
+  											console.error(`\x1b[31m[STREAM] Failed to record token usage: ${err.message}\x1b[0m`);
+  										});
+  										usageRecorded = true;
+  									}
+  								}
+  							} catch (e) {
+  								// Ignore parse errors
+  							}
+  						}
+  					}
+  				}
+  				wrappedStream.end();
+  			});
+ 
+  			originalStream.on('error', (error) => {
+  				wrappedStream.emit('error', error);
+  			});
+ 
+  			return wrappedStream;
+  		},
+  		async (accountId, stream) => {
+  			await this.incrementRequestCount(accountId);
+  			this.healthManager.incrementAccountRateLimit(accountId);
+  			this.handleSuccessfulProxyUsage(accountId);
+  		}
+  	);
   }
 
   /**
@@ -1511,34 +1487,27 @@ class QwenAPI {
      * @returns {Promise<Object>} - Web search results
    */
   async webSearch(request) {
-    await this.refreshAccountProxyBindings();
-    const configuredAccounts = this.buildAccountList(request);
-
-    // Reset last used account info
-    this._lastUsedAccountId = null;
-    this._lastUsedProxyId = null;
-
-    return await this.executeWithAccountRotation(
-      configuredAccounts,
-      async (accountInfo) => {
-        await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
-        return this.processWebSearchWithAccount(request, accountInfo);
-      },
-      async (accountId, response) => {
-        // Store the account and proxy used for this request
-        this._lastUsedAccountId = accountId;
-        this._lastUsedProxyId = this.proxyManager.getProxyForAccount(accountId);
-
-        await this.incrementWebSearchRequestCount(accountId);
-        this.healthManager.incrementAccountRateLimit(accountId);
-        this.handleSuccessfulProxyUsage(accountId);
-
-        const resultCount = response?.data?.docs?.length || 0;
-        if (resultCount > 0) {
-          await this.incrementWebSearchResultCount(accountId, resultCount);
-        }
-      }
-    );
+  	await this.refreshAccountProxyBindings();
+  	const configuredAccounts = this.buildAccountList(request);
+ 
+  	// Return {response, metadata} - request-scoped, no race condition
+  	return await this.executeWithAccountRotation(
+  		configuredAccounts,
+  		async (accountInfo) => {
+  			await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
+  			return this.processWebSearchWithAccount(request, accountInfo);
+  		},
+  		async (accountId, response) => {
+  			await this.incrementWebSearchRequestCount(accountId);
+  			this.healthManager.incrementAccountRateLimit(accountId);
+  			this.handleSuccessfulProxyUsage(accountId);
+ 
+  			const resultCount = response?.data?.docs?.length || 0;
+  			if (resultCount > 0) {
+  				await this.incrementWebSearchResultCount(accountId, resultCount);
+  			}
+  		}
+  	);
   }
 
   /**

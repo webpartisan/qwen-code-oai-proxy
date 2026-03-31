@@ -119,8 +119,10 @@ class AccountHealthManager {
   }
 
   getBlockTime(strikes) {
-    const index = Math.min(strikes - 1, this.blockTimes.length - 1);
-    return this.blockTimes[index] || this.blockTimes[this.blockTimes.length - 1];
+  	const index = Math.min(strikes - 1, this.blockTimes.length - 1);
+  	const blockTime = this.blockTimes[index];
+  	// Use explicit undefined check instead of || to handle 0 correctly
+  	return blockTime !== undefined ? blockTime : this.blockTimes[this.blockTimes.length - 1];
   }
 
   resetStrikes(accountId) {
