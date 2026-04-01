@@ -27,14 +27,16 @@ class AccountHealthManager {
     this.rateLimitMax = maxRequestsPerMinute;
     
     this.blockTimes = [
-      0,
-      0,
-      60000,
-      300000,
-      900000,
-      1800000,
-      3600000,
-      43200000
+    	0,        // Strike 1: No block
+    	0,        // Strike 2: No block
+    	60000,    // Strike 3: 1 minute
+    	300000,   // Strike 4: 5 minutes
+    	900000,   // Strike 5: 15 minutes
+    	1800000,  // Strike 6: 30 minutes
+    	3600000,  // Strike 7: 60 minutes
+    	7200000,  // Strike 8: 120 minutes
+    	14400000, // Strike 9: 240 minutes
+    	28800000, // Strike 10+: 480 minutes (8 hours)
     ];
     
     this.maxAttempts = 5;

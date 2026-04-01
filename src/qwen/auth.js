@@ -84,13 +84,14 @@ class QwenAuthManager {
       return { config: {}, proxyId: null };
     }
 
-    // Get proxy for account (or default proxy)
+    // Get proxy for account (or random proxy)
     let proxyId;
     if (accountId && this.proxyManager.accountProxyMapping.has(accountId)) {
       proxyId = this.proxyManager.getProxyForAccount(accountId);
     } else {
-      // Use first available proxy for OAuth if no account-specific binding
-      proxyId = this.proxyManager.availableProxies[0];
+      // Use random available proxy for OAuth if no account-specific binding
+      const availableProxies = this.proxyManager.availableProxies;
+      proxyId = availableProxies[Math.floor(Math.random() * availableProxies.length)];
     }
 
     if (!proxyId) {

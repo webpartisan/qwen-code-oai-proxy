@@ -1,8 +1,33 @@
 #!/usr/bin/env node
 
 const { QwenAuthManager } = require('./src/qwen/auth.js');
+const { ProxyManager } = require('./src/utils/proxyManager.js');
+const config = require('./src/config.js');
 const qrcode = require('qrcode-terminal');
 const open = require('open');
+
+/**
+ * Create a ProxyManager instance for CLI authentication
+ * @returns {ProxyManager|null} ProxyManager instance or null if no proxies configured
+ */
+function createCliProxyManager() {
+  const proxyList = process.env.PROXY_LIST || '';
+  if (!proxyList || proxyList.trim() === '') {
+    console.log('\x1b[33m[CLI] No PROXY_LIST configured, using direct connection\x1b[0m');
+    return null;
+  }
+  
+  const proxyManager = new ProxyManager({
+    proxyList,
+    useDefaultProxyWithList: process.env.USE_DEFAULT_PROXY_WITH_LIST === 'true',
+    badProxyCooldownMs: 10 * 60 * 1000,
+    proxyConsecutiveNetworkErrors: 3,
+    maxRequestsPerMinutePerIp: 60,
+    proxyRecoveryCheckIntervalMs: 60000,
+  });
+  
+  return proxyManager;
+}
 
 async function listAccounts() {
   console.log('Listing all Qwen accounts...');
@@ -52,6 +77,13 @@ async function addAccount(accountId) {
   
   try {
     const authManager = new QwenAuthManager();
+    
+    // Initialize proxy manager for OAuth requests
+    const proxyManager = createCliProxyManager();
+    if (proxyManager) {
+      authManager.setProxyManager(proxyManager);
+      console.log(`\x1b[36m[CLI] Using random proxy from ${proxyManager.availableProxies.length} configured proxies for OAuth\x1b[0m`);
+    }
     
     // Initiate device flow
     console.log('\nInitiating device flow...');

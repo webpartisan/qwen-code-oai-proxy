@@ -647,6 +647,51 @@ class ProxyManager {
    }
    
    /**
+    * Activate skipped accounts when all bound accounts are blocked
+    * This is a fallback mechanism to ensure service continuity
+    * @param {string[]} blockedAccountIds - Array of currently blocked account IDs
+    * @returns {string[]} Array of newly activated account IDs
+    */
+   activateSkippedAccountsForBlockedAccounts(blockedAccountIds) {
+    if (this.skippedAccounts.length === 0) {
+    	return [];
+    }
+   
+    const activatedAccounts = [];
+    const blockedSet = new Set(blockedAccountIds);
+   
+    // Find bound accounts that are in the blocked list
+    const blockedBoundAccounts = this.boundAccountIds.filter(id => blockedSet.has(id));
+   
+    if (blockedBoundAccounts.length === 0) {
+    	return [];
+    }
+   
+    // For each blocked bound account, try to activate a skipped account with its proxy
+    for (const blockedAccountId of blockedBoundAccounts) {
+    	if (this.skippedAccounts.length === 0) {
+    		break;
+    	}
+   
+    	const proxyId = this.accountProxyMapping.get(blockedAccountId);
+    	if (!proxyId || !this.isProxyUsable(proxyId)) {
+    		continue;
+    	}
+   
+    	// Activate a skipped account with the same proxy
+    	// Note: This creates a many-to-one mapping (multiple accounts -> same proxy)
+    	const skippedAccountId = this.skippedAccounts.shift();
+    	this.accountProxyMapping.set(skippedAccountId, proxyId);
+    	this.boundAccountIds.push(skippedAccountId);
+    	activatedAccounts.push(skippedAccountId);
+   
+    	console.log(`\x1b[32m[ProxyManager] Activated skipped account '${skippedAccountId}' as fallback for blocked account '${blockedAccountId}' with proxy '${proxyId}'\x1b[0m`);
+    }
+   
+    return activatedAccounts;
+   }
+   
+   /**
     * Find an account that currently has no usable proxy
     * @returns {string|null} The account ID or null if all accounts have usable proxies
     */

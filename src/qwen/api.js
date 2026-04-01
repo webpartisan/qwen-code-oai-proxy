@@ -677,6 +677,25 @@ class QwenAPI {
       return candidates;
     }
 
+    // Fallback: activate skipped accounts when all bound accounts are blocked
+    const blockedAccountIds = [];
+    for (const accountId of accountIds) {
+      if (this.healthManager.isBlocked(accountId)) {
+        blockedAccountIds.push(accountId);
+      }
+    }
+
+    if (blockedAccountIds.length > 0) {
+      const activatedAccounts = this.proxyManager.activateSkippedAccountsForBlockedAccounts(blockedAccountIds);
+      if (activatedAccounts.length > 0) {
+        // Try to get candidates from newly activated accounts
+        candidates = await this.getPreparedAccounts(activatedAccounts);
+        if (candidates.length > 0) {
+          return candidates;
+        }
+      }
+    }
+
     const singleAccountFallback = accountIds.length === 1;
 
     candidates = await this.getPreparedAccounts(accountIds, {
