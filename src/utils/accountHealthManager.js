@@ -32,11 +32,13 @@ class AccountHealthManager {
     	60000,    // Strike 3: 1 minute
     	300000,   // Strike 4: 5 minutes
     	900000,   // Strike 5: 15 minutes
-    	1800000,  // Strike 6: 30 minutes
-    	3600000,  // Strike 7: 60 minutes
-    	7200000,  // Strike 8: 120 minutes
-    	14400000, // Strike 9: 240 minutes
-    	28800000, // Strike 10+: 480 minutes (8 hours)
+    	900000,   // Strike 6: 15 minutes
+    	1800000,  // Strike 7: 30 minutes
+    	1800000,  // Strike 8: 30 minutes
+    	3600000,  // Strike 9: 60 minutes
+    	3600000,  // Strike 10: 60 minutes
+    	7200000,  // Strike 11: 120 minutes
+    	14400000, // Strike 12+: 240 minutes (4 hours)
     ];
     
     this.maxAttempts = 5;
