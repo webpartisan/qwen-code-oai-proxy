@@ -16,7 +16,8 @@
     "auth:counts": "node authenticate.js counts",
     "auth:tokens": "node usage.js",
     "tokens": "node usage.js",
-    "usage": "node usage.js"
+    "usage": "node usage.js",
+    "health": "node health.js"
   },
   "keywords": [
     "qwen",
