@@ -1048,27 +1048,38 @@ class QwenAPI {
       let attemptedRequest = false;
 
       for (const candidate of candidates) {
-        try {
-          attemptsUsed += 1;
-          attemptsByAccount.set(candidate.accountId, (attemptsByAccount.get(candidate.accountId) || 0) + 1);
+          try {
+              attemptsUsed += 1;
+              attemptsByAccount.set(candidate.accountId, (attemptsByAccount.get(candidate.accountId) || 0) + 1);
 
-          const proxyId = this.proxyManager.getProxyForAccount(candidate.accountId);
-          const proxyUrl = proxyId ? this.proxyManager.getProxyUrl(proxyId) : null;
-          const proxyInfo = proxyUrl ? `${proxyId} → ${proxyUrl}` : (proxyId || 'local');
-          console.log(`\x1b[36mSelected account for request attempt: ${candidate.accountId} (proxy: ${proxyInfo})\x1b[0m`);
-          const result = await this.executeOperationWithAccount(candidate, executeAttempt);
-          attemptedRequest = true;
-          await onSuccess(candidate.accountId, result);
-          this.healthManager.resetStrikes(candidate.accountId);
-          console.log(`\x1b[32m[ACCOUNT ${candidate.accountId}] Request successful (proxy: ${proxyInfo})\x1b[0m`);
-          // Return wrapped response with metadata (request-scoped, no race condition)
-          return {
-          	response: result,
-          	metadata: {
-          		accountId: candidate.accountId,
-          		proxyId: proxyId
-          	}
-          };
+              // Get the bound proxy for initial logging (may be rebalanced later)
+              const boundProxyId = this.proxyManager.getProxyForAccount(candidate.accountId);
+              const boundProxyUrl = boundProxyId ? this.proxyManager.getProxyUrl(boundProxyId) : null;
+              const boundProxyInfo = boundProxyUrl ? `${boundProxyId} → ${boundProxyUrl}` : (boundProxyId || 'local');
+              console.log(`\x1b[36mSelected account for request attempt: ${candidate.accountId} (bound proxy: ${boundProxyInfo})\x1b[0m`);
+              const executeResult = await this.executeOperationWithAccount(candidate, executeAttempt);
+              
+              // Handle both old format (direct result) and new format ({result, proxyId})
+              const result = executeResult?.result !== undefined ? executeResult.result : executeResult;
+              const actualProxyId = executeResult?.proxyId !== undefined
+                  ? executeResult.proxyId
+                  : this.proxyManager.ensureUsableProxyForAccount(candidate.accountId);
+              
+              attemptedRequest = true;
+              await onSuccess(candidate.accountId, result);
+              this.healthManager.resetStrikes(candidate.accountId);
+  
+              const actualProxyUrl = actualProxyId ? this.proxyManager.getProxyUrl(actualProxyId) : null;
+              const actualProxyInfo = actualProxyUrl ? `${actualProxyId} → ${actualProxyUrl}` : (actualProxyId || 'local');
+              console.log(`\x1b[32m[ACCOUNT ${candidate.accountId}] Request successful (proxy: ${actualProxyInfo})\x1b[0m`);
+              // Return wrapped response with metadata (request-scoped, no race condition)
+              return {
+                  response: result,
+                  metadata: {
+                      accountId: candidate.accountId,
+                      proxyId: actualProxyId
+                  }
+              };
         } catch (outcome) {
           if (outcome.locked) {
             attemptsUsed -= 1;
@@ -1179,16 +1190,17 @@ class QwenAPI {
   }
 
   async chatCompletions(request) {
-  	await this.refreshAccountProxyBindings();
-  	const configuredAccounts = this.buildAccountList(request);
- 
-  	// Return {response, metadata} - request-scoped, no race condition
-  	return await this.executeWithAccountRotation(
-  		configuredAccounts,
-  		async (accountInfo) => {
-  			await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
-  			return this.processRequestWithAccount(request, accountInfo);
-  		},
+      await this.refreshAccountProxyBindings();
+      const configuredAccounts = this.buildAccountList(request);
+
+      // Return {response, metadata} - request-scoped, no race condition
+      return await this.executeWithAccountRotation(
+          configuredAccounts,
+          async (accountInfo) => {
+              const proxyId = await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
+              const result = await this.processRequestWithAccount(request, accountInfo);
+              return { result, proxyId };
+          },
   		async (accountId, response) => {
   			await this.incrementRequestCount(accountId);
   			this.healthManager.incrementAccountRateLimit(accountId);
@@ -1402,23 +1414,23 @@ class QwenAPI {
   	return await this.executeWithAccountRotation(
   		configuredAccounts,
   		async (accountInfo) => {
-  			await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
- 
-  			const originalStream = await this.processStreamingRequestWithAccount(request, accountInfo);
- 
-  			// Wrap the stream to capture token usage from the final chunk
-  			const { PassThrough } = require('stream');
-  			const wrappedStream = new PassThrough();
-  			let buffer = '';
-  			let usageRecorded = false;
- 
-  			// Attach metadata to stream (request-scoped, no race condition)
-  			wrappedStream.metadata = {
-  				accountId: accountInfo.accountId,
-  				proxyId: this.proxyManager.getProxyForAccount(accountInfo.accountId),
-  				inputTokens: 0,
-  				outputTokens: 0
-  			};
+  		    const proxyId = await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
+
+  		    const originalStream = await this.processStreamingRequestWithAccount(request, accountInfo);
+
+  		    // Wrap the stream to capture token usage from the final chunk
+  		    const { PassThrough } = require('stream');
+  		    const wrappedStream = new PassThrough();
+  		    let buffer = '';
+  		    let usageRecorded = false;
+
+  		    // Attach metadata to stream (request-scoped, no race condition)
+  		    wrappedStream.metadata = {
+  		        accountId: accountInfo.accountId,
+  		        proxyId: proxyId,
+  		        inputTokens: 0,
+  		        outputTokens: 0
+  		    };
  
   			originalStream.on('data', (chunk) => {
   				const chunkStr = chunk.toString();
@@ -1511,12 +1523,13 @@ class QwenAPI {
  
   	// Return {response, metadata} - request-scoped, no race condition
   	return await this.executeWithAccountRotation(
-  		configuredAccounts,
-  		async (accountInfo) => {
-  			await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
-  			return this.processWebSearchWithAccount(request, accountInfo);
-  		},
-  		async (accountId, response) => {
+  	    configuredAccounts,
+  	    async (accountInfo) => {
+  	        const proxyId = await this.waitForAccountAndIpRateLimit(accountInfo.accountId);
+  	        const result = await this.processWebSearchWithAccount(request, accountInfo);
+  	        return { result, proxyId };
+  	    },
+  	    async (accountId, response) => {
   			await this.incrementWebSearchRequestCount(accountId);
   			this.healthManager.incrementAccountRateLimit(accountId);
   			this.handleSuccessfulProxyUsage(accountId);

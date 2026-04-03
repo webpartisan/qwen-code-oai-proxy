@@ -130,14 +130,18 @@ class ProxyManager {
    * @returns {ProxyAgent|null} The ProxyAgent or null if virtual proxy
    */
   getProxyAgent(proxyId) {
-    const proxyUrl = this.getProxyUrl(proxyId);
-    if (!proxyUrl) return null;
+      const proxyUrl = this.getProxyUrl(proxyId);
+      if (!proxyUrl) return null;
 
-    if (!this.proxyAgents.has(proxyId)) {
-      this.proxyAgents.set(proxyId, new ProxyAgent(proxyUrl));
-    }
+      if (!this.proxyAgents.has(proxyId)) {
+          // ProxyAgent requires getProxyForUrl function to actually use the proxy
+          // If we pass just a string, it will be treated as options and fallback to direct connection
+          this.proxyAgents.set(proxyId, new ProxyAgent({
+              getProxyForUrl: () => proxyUrl
+          }));
+      }
 
-    return this.proxyAgents.get(proxyId);
+      return this.proxyAgents.get(proxyId);
   }
 
   /**
