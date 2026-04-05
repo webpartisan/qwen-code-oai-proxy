@@ -128,3 +128,5 @@ debug/
 test.sh
 log
 test-proxy.sh
+.archaeon/
+docs/reverse-spec/

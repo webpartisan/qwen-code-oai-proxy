@@ -37,7 +37,7 @@ const QWEN_CODE_VERSION = '0.12.0';
 
 // Model aliases - maps client-facing model names to actual Qwen model names
 const MODEL_ALIASES = {
-  'qwen3.5-plus': 'coder-model'
+  'qwen3.6-plus': 'coder-model'
 };
 
 function resolveModelAlias(model) {
